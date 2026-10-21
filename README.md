@@ -3,6 +3,10 @@
 对 **WorkBuddy / Qoder / Codex / Claude** 等桌面 AI 应用的模型流量做**只读**监测：**上下行 tokens/秒**、输入 / 输出 tokens、缓存命中、积分消耗、上下文占用。
 设计参考 [ccusage](https://ccusage.com) 的燃烧率与状态条语义、[splitrail](https://github.com/Piebald-AI/splitrail) 的环比 / 堆叠趋势 / 可筛选明细结构。
 
+> **English** · A local-first, read-only usage monitor for desktop AI apps — WorkBuddy, Qoder, Codex and Claude. Live up/down tokens per second, cache hit rate, credit burn and context usage in a floating capsule, a full dashboard and a desktop pet. Optional balance checks cover DeepSeek, OpenRouter, Moonshot, New API, linoroute, LMU and Zhipu GLM. Built with Python + tkinter for Windows; usage data stays on your machine and only the balance requests you enable reach your providers.
+>
+> **Keywords:** LLM token monitor · AI usage tracker · cost tracking · desktop pet · tkinter dashboard · local-first
+
 | 形态 | 说明 |
 |---|---|
 | **置顶悬浮胶囊** | 无边框浮窗，可拖到模型选择器旁边，实时显示 `模型 · 速率 ↓下行 ↑上行 t/s · 上下文%` |
