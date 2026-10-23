@@ -1,9 +1,9 @@
 # WorkBuddy Token 监测
 
-对 **WorkBuddy / Qoder / Codex / Claude** 等桌面 AI 应用的模型流量做**只读**监测：**上下行 tokens/秒**、输入 / 输出 tokens、缓存命中、积分消耗、上下文占用。
+对 **WorkBuddy / Qoder / Codex / Claude / CodeBuddy** 等桌面 AI 应用的模型流量做**只读**监测：**上下行 tokens/秒**、输入 / 输出 tokens、缓存命中、积分消耗、上下文占用。
 设计参考 [ccusage](https://ccusage.com) 的燃烧率与状态条语义、[splitrail](https://github.com/Piebald-AI/splitrail) 的环比 / 堆叠趋势 / 可筛选明细结构。
 
-> **English** · A local-first, read-only usage monitor for desktop AI apps — WorkBuddy, Qoder, Codex and Claude. Live up/down tokens per second, cache hit rate, credit burn and context usage in a floating capsule, a full dashboard and a desktop pet. Optional balance checks cover DeepSeek, OpenRouter, Moonshot, New API, linoroute, LMU and Zhipu GLM. Built with Python + tkinter for Windows; usage data stays on your machine and only the balance requests you enable reach your providers.
+> **English** · A local-first, read-only usage monitor for desktop AI apps — WorkBuddy, Qoder, Codex, Claude and CodeBuddy. Live up/down tokens per second, cache hit rate, credit burn and context usage in a floating capsule, a full dashboard and a desktop pet. Optional balance checks cover DeepSeek, OpenRouter, Moonshot, New API, linoroute, LMU and Zhipu GLM. Built with Python + tkinter for Windows; usage data stays on your machine and only the balance requests you enable reach your providers.
 >
 > **Keywords:** LLM token monitor · AI usage tracker · cost tracking · desktop pet · tkinter dashboard · local-first
 
@@ -72,13 +72,24 @@
 | 来源 | 字段 | 用途 |
 |---|---|---|
 | `workbuddy.db` → `sessions` | `model`、`context_window`、`updated_at` | 会话元数据 |
-| `workbuddy.db` → `session_usage` | `used`、`size` | **实时上下文占用** |
+| `workbuddy.db` → `session_usage` | `used`、`size` | **实时上下文占用**（`size` 是模型物理窗口，见下节双口径） |
 | `projects/**/*.jsonl` → `providerData.rawUsage` | `prompt_tokens`、`completion_tokens`、`prompt_cache_hit_tokens`、`credit` | **逐请求 token 与积分** |
 | `traces/**/trace_*.json` → `spans[generation]` | `duration`、`endedAt` | **真实生成耗时 → 基线速率** |
 
 - 数据库以 `mode=ro` 打开，全程不写入；
 - JSONL 与 trace 均按 `(mtime, size)` 指纹增量解析（首跑约 3 s，之后约 0.9 s）；
 - 同一 `messageId` 只计一次，避免流式落盘重复计数。
+
+### 其它应用（`sources.py`）
+
+| 来源 | 本地路径 | 可用指标 |
+|---|---|---|
+| Qoder | `~/.qoder-cn` 的 logs / projects | credits、耗时、工具区间；token 恒为 0 |
+| Codex | `~/.codex` 的 rollout / sqlite | token、耗时、TTFT |
+| Claude Code | `~/.claude` 的 projects | token |
+| CodeBuddy（VSCode 插件） | `%LOCALAPPDATA%\CodeBuddyExtension\Data\*\VSCode\*\history\*\*\index.json` | token / cache / credit / elapsedMs |
+
+各源记录统一带 `src` 字段，UI 依据 `caps` 能力位显示真值或「—」，不会把缺失当成 0。
 
 ### 其他指标口径
 
@@ -89,7 +100,26 @@
 | 积分消耗 | `rawUsage.credit` 累加（WorkBuddy 计费口径） |
 | 燃烧率 | 区间内 tokens ÷ 活跃分钟（各会话首尾跨度之和，不含会话间空档） |
 | 环比 | 与上一等长周期对比（今日 ↔ 昨日同一时刻；7 天 ↔ 前 7 天） |
-| 上下文占用 | `session_usage.used ÷ size`，用于判断何时该新开会话 |
+| 上下文占用 | `session_usage.used ÷ sessions.context_window`（有效窗口，与 WorkBuddy 界面一致） |
+
+### 上下文占用的双口径
+
+WorkBuddy 的窗口有两个数，混用会产生固定倍数偏差：
+
+| 口径 | 来源 | 典型值 | 语义 |
+|---|---|---|---|
+| **有效窗口**（主） | `sessions.context_window` | 600,000 | 界面百分比与**自动压缩**的判定基准 |
+| **物理窗口**（副） | `session_usage.size`（= `models.json` 的 `maxInputTokens`） | 1,000,000 | 模型的硬性输入上限 |
+
+主口径就是界面读到的那个数，也是判断"何时会被压缩"的依据；物理口径是模型能力上限。
+两者比值固定（本例 1.67×），只用物理口径会**系统性低估**约 40%。
+
+- 仪表盘 hero 的「当前上下文」显示主口径，其后灰色小字给出物理口径（`物理 15.4%`）；
+- 会话明细与「正在运行」的百分比，悬停可同时看到两个数；
+- 两者相同时（老会话没有 `context_window`、或非 WorkBuddy 源）不显示副标。
+
+> 自动压缩只让 `used` 回落，**不改变**两套口径的换算关系 ——
+> 压缩前后两边的百分比始终相差同一个倍数，不会也不应该对齐。
 
 ---
 
@@ -149,6 +179,7 @@ python collector.py today           # 单行文本（可接入其它状态栏）
 | 文件 | 作用 |
 |---|---|
 | `collector.py` | 数据层：DB + JSONL + trace 解析、增量缓存、速率与聚合 |
+| `sources.py` | 其它应用数据源：Qoder / Codex / Claude Code / CodeBuddy |
 | `server.py` | 本地 HTTP 服务：`/`、`/api/summary?scope=`、`/api/live`、`/api/health` |
 | `dashboard.html` | 仪表盘（单文件、手写 SVG、无外部依赖、可离线） |
 | `overlay.py` | 置顶桌宠与数据面板（tkinter，无第三方依赖） |
@@ -739,33 +770,6 @@ def run():
 **验证**：桩对象逐项点击——六个勾选项的变量都正确翻转、处理器读到新值、重新生成菜单
 时勾选态同步；四个单选子菜单的设置值与提示文字一致。
 
-### v3.17 多应用自动跟随 + 一手 token 数据
-
-**问题**：仪表盘虽然有 WorkBuddy / Qoder / Codex / Claude 四个来源，但此前自动模式主要
-看"最近有没有请求"，切到对应应用后经常要等十几秒才有反应；Codex / Claude 的历史数据
-还要靠 cc-switch 间接补；Qoder 没有 token 时，面板和基线表会挂着 0 t/s 或空白上下文。
-
-**做法**：
-
-- **自动跟随**：综合最近活动时间、当前前台进程和 20 秒防抖；用户主动切到某个应用时
-  立即跟随，后台应用偶发请求不会把标签来回抢。新增 `source=auto` 白名单与
-  `/api/live` 的 `requested_source` / `units` 字段。
-- **一手数据优先**：Codex 直接读原生 `sessions/**/rollout-*.jsonl`（token、真实首字延迟），
-  Claude 直接读 `projects/**/*.jsonl`；cc-switch 只在原生数据缺失时补历史与 TTFT，
-  不再反向覆盖一手记录。Qoder 明确只有 credits 与 `context_usage_ratio`，不伪造 token。
-- **单位自适应**：面板和看板按来源显示 `tokens/s`、`credits/min`、`requests/min`；
-  标题、排序、燃烧率与基线卡随单位切换，Qoder 不再出现一排 0 t/s。
-- **模型后面标 agent**：生成基线表在模型名后标注实际调用它的来源
-  （WorkBuddy / Qoder / Codex / Claude），同一模型被多个 agent 使用会并列显示；
-  悬停可看各自采样次数和其中子 agent 的请求数。
-- **面板细节**：速率单位按字体实际宽度让位（修复 `req/min` 压住数字）；服务未启动时
-  本地兜底保留上下文与活跃状态，并会在连续取不到数据时自动拉起 `server.py`。
-- 重写随机漫步与鼠标注视的更新路径，减少状态泵抖动；对应开关在设置中按需开启。
-
-**验证**（2026-10-23，本机）：自动源在前台切换到 Codex 时立即生效，后台请求防抖正常；
-基线表 905 次 `DeepSeek-V4.1-Flash` 采样正确并列 WorkBuddy / Qoder，Codex 行并列 Claude；
-停掉服务后桌宠在约 9 秒内自动恢复；看板无控制台报错。
-
 ### v3.16 余额提取器：linoroute / LMU / Zhipu GLM
 
 **问题**：这三家在设置页一直是"未启用 + 备注原因"，但站点其实都有余额接口——
@@ -809,6 +813,70 @@ def extract(response):
 
 > 注意：修改的是 Python 代码，需重启服务（`stop.cmd` → `start.cmd`）才会生效；
 > 余额查询本身是 GET，不改动任何服务商的数据。
+
+### v3.17 多应用自动跟随 + 一手 token 数据
+
+**问题**：仪表盘虽然有 WorkBuddy / Qoder / Codex / Claude 四个来源，但此前自动模式主要
+看"最近有没有请求"，切到对应应用后经常要等十几秒才有反应；Codex / Claude 的历史数据
+还要靠 cc-switch 间接补；Qoder 没有 token 时，面板和基线表会挂着 0 t/s 或空白上下文。
+
+**做法**：
+
+- **自动跟随**：综合最近活动时间、当前前台进程和 20 秒防抖；用户主动切到某个应用时
+  立即跟随，后台应用偶发请求不会把标签来回抢。新增 `source=auto` 白名单与
+  `/api/live` 的 `requested_source` / `units` 字段。
+- **一手数据优先**：Codex 直接读原生 `sessions/**/rollout-*.jsonl`（token、真实首字延迟），
+  Claude 直接读 `projects/**/*.jsonl`；cc-switch 只在原生数据缺失时补历史与 TTFT，
+  不再反向覆盖一手记录。Qoder 明确只有 credits 与 `context_usage_ratio`，不伪造 token。
+- **单位自适应**：面板和看板按来源显示 `tokens/s`、`credits/min`、`requests/min`；
+  标题、排序、燃烧率与基线卡随单位切换，Qoder 不再出现一排 0 t/s。
+- **模型后面标 agent**：生成基线表在模型名后标注实际调用它的来源
+  （WorkBuddy / Qoder / Codex / Claude），同一模型被多个 agent 使用会并列显示；
+  悬停可看各自采样次数和其中子 agent 的请求数。
+- **面板细节**：速率单位按字体实际宽度让位（修复 `req/min` 压住数字）；服务未启动时
+  本地兜底保留上下文与活跃状态，并会在连续取不到数据时自动拉起 `server.py`。
+- 重写随机漫步与鼠标注视的更新路径，减少状态泵抖动；对应开关在设置中按需开启。
+
+**验证**（2026-10-23，本机）：自动源在前台切换到 Codex 时立即生效，后台请求防抖正常；
+基线表 905 次 `DeepSeek-V4.1-Flash` 采样正确并列 WorkBuddy / Qoder，Codex 行并列 Claude；
+停掉服务后桌宠在约 9 秒内自动恢复；看板无控制台报错。
+
+### v3.18 CodeBuddy 数据源 + 上下文双口径
+
+**问题**：v3.17 之后面板覆盖了 WorkBuddy / Qoder / Codex / Claude 四家，但 CodeBuddy 的
+VSCode 插件同样把**逐请求**的用量落在本地，却不在监测范围内。另一方面，看板的「当前
+上下文」取 `session_usage.size`（模型**物理**输入上限，1,000,000），而 WorkBuddy 界面
+显示的是 `sessions.context_window`（**有效**窗口，600,000）——两者固定相差 1.67 倍，
+读数比客户端低约 40%，且自动压缩的判定基准是后者。
+
+**做法**：
+
+- **CodeBuddy 数据源**：新增 `codebuddy` 源，读
+  `%LOCALAPPDATA%\CodeBuddyExtension\Data\*\VSCode\*\history\*\*\index.json`
+  （`Data/default/...` 为未登录账本，同一通配覆盖）。`requests[].usage` 提供
+  input / output / cache / credit；模型名取 `messages/<assistant>.json` 的
+  `extra.modelName`，耗时取 `statsSnapshot.elapsedMs`，取不到时退回会话级
+  `selectedModelId` 与首条 assistant 消息。能力位 `tokens / credits / dur`，无工具区间。
+- **上下文双口径**：新增 `collector.ctx_gauges()`。主口径 `size / pct` 取
+  `sessions.context_window`（有效窗口，界面百分比与自动压缩的判定基准），副口径
+  `size_model / pct_model` 取 `session_usage.size`（物理窗口）。`/api/live` 与明细行
+  同步下发，两者相同时后端把 `size_model` 置 0，前端据此不渲染副标。
+- **看板**：hero 读数后追加小一号灰字「物理 x%」；明细表列宽有限，双口径放进
+  `title` 悬停提示，避免把进度条挤变形。
+- **应用页签可拖动排序**：顺序存 `localStorage` 的 `tm.srcOrder`；「自动 / 全部」不设
+  `draggable`，固定在左侧；未记录的新来源按 DOM 原序追加，不影响已有顺序。
+- 桌宠面板透传新字段（`overlay.py`），非 WorkBuddy 源不显示副标（`size_model` 置 0）。
+- 新增 `publish_snapshot.py`：把本地仪表盘抓成可公开托管的静态快照
+  （`dist/index.html` + 预抓取接口响应 + 图标），只读 GET，不改动任何源数据。
+
+**验证**（2026-10-23，本机）：
+
+- 13 个 `.py` / `.pyw` 全部通过 `py_compile`。
+- CodeBuddy 源：7 份会话索引解析出 6 条请求，in 171,985 / out 15,946 /
+  cached 143,936 / reasoning 6,934，credit 3.8；模型为 `auto` 与
+  `deepseek-v4.1-flash`，6 条均带真实耗时（中位 18.2 s，最长 194 s —— 含工具执行等待）。
+- `ctx_gauges(used=154000, size=1_000_000, window=600_000)` → 有效 25.7% / 物理 15.4%；
+  两口径相同时 `size_model` 归 0；老会话缺 `context_window` 时退回物理口径单读数。
 
 ## 十、怎么启动（v3.7）
 

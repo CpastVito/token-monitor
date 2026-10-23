@@ -212,6 +212,10 @@
   .tabs-ghost .tab{padding:0 10px;color:var(--faint);font-size:var(--fs-cap);border-radius:var(--r-pill)}
   .tabs-ghost .tab:hover{background:rgba(118,118,128,.09);color:var(--text2)}
   .tabs-ghost .tab.on{background:var(--accent-soft);color:var(--accent);box-shadow:none;font-weight:600}
+  /* 应用页签可拖动排序；「自动/全部」不设 draggable，固定在左 */
+  #srcTabs .tab[draggable="true"]{cursor:grab}
+  #srcTabs .tab[draggable="true"]:active{cursor:grabbing}
+  #srcTabs .tab.dragging{opacity:.4}
   /* 窄屏时让时间区间整组保住，只让数据源那排横向滚动，
      否则多一个「自动」后「全部/30 天」会被挤出可视区。 */
   #tabs{flex:0 0 auto}
@@ -477,6 +481,11 @@
   }
   .ctxfill{height:100%;border-radius:var(--r-pill);transition:width .6s var(--ease)}
   .ctxpct{font-size:var(--fs-cap);font-weight:600;font-variant-numeric:tabular-nums;min-width:34px;text-align:right}
+  /* 上下文副标：物理窗口口径，比主口径小一号，不抢主读数的注意力 */
+  .ctxalt{
+    font-style:normal;font-size:11px;font-weight:400;color:var(--hero-faint);
+    margin-left:6px;letter-spacing:0;
+  }
 
   .search{
     appearance:none;-webkit-appearance:none;
@@ -1010,13 +1019,15 @@
       <button class="tab" data-scope="all">全部</button>
     </div>
     <span class="toolbar-div" aria-hidden="true"></span>
-    <div class="tabs tabs-ghost" id="srcTabs" title="按应用筛选（各应用能给的指标不同）">
+    <div class="tabs tabs-ghost" id="srcTabs"
+         title="按应用筛选（各应用能给的指标不同）；拖动应用页签可调整顺序">
       <button class="tab" data-source="auto">自动</button>
       <button class="tab on" data-source="all">全部</button>
-      <button class="tab" data-source="workbuddy">WorkBuddy</button>
-      <button class="tab" data-source="qoder">Qoder</button>
-      <button class="tab" data-source="codex">Codex</button>
-      <button class="tab" data-source="claude">Claude</button>
+      <button class="tab" data-source="workbuddy" draggable="true">WorkBuddy</button>
+      <button class="tab" data-source="qoder" draggable="true">Qoder</button>
+      <button class="tab" data-source="codex" draggable="true">Codex</button>
+      <button class="tab" data-source="claude" draggable="true">Claude</button>
+      <button class="tab" data-source="codebuddy" draggable="true">CodeBuddy</button>
     </div>
   </div>
 </header>
@@ -1257,7 +1268,7 @@
     基线值取 <code>traces</code> 中 <code>generation</code> span 的真实耗时（会话结束后才落盘，故为历史基线）。<br>
     数据来源：各应用自己的本地用量记录 —— WorkBuddy 读 <code>workbuddy.db</code> /
     <code>projects/**/*.jsonl</code> / <code>traces/**</code>，Qoder 读其 logs 与 projects，
-    Codex / Claude 读各自的本地会话库；全程只读，不修改任何应用的数据。
+    Codex / Claude 读各自的本地会话库，CodeBuddy 读 VSCode 插件的会话索引；全程只读，不修改任何应用的数据。
   </div>
 </div>
 
@@ -1303,6 +1314,11 @@
     return (m / 60).toFixed(1) + "h";
   }
   const pct = (v, d = 1) => ((v || 0) * 100).toFixed(d) + "%";
+  // 上下文双口径的悬停提示：主口径是客户端有效窗口，物理窗口仅在两者不同时补一句。
+  // 表格列宽有限，副标放 title 而不是行内，避免把进度条挤变形。
+  const ctxTip = (o) => (o && +o.pct_model)
+    ? ` title="有效窗口 ${pct(o.pct)} · 物理窗口 ${pct(o.pct_model)}"`
+    : "";
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
     { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   function ago(ts) {
@@ -1435,8 +1451,16 @@
     } else {
       $("h-turn").textContent = "—";
     }
-    $("h-ctx").textContent = (lv.size || lv.pct) ? pct(lv.pct) : "—";
-    $("h-ctx").style.color = (lv.size || lv.pct)
+    // 主口径 = 客户端有效窗口（sessions.context_window，与 WorkBuddy 界面一致，
+    // 也是自动压缩的判定基准）；物理窗口口径（模型 maxInputTokens）作副标。
+    // 两者相同时后端已把 pct_model 置 0，这里不渲染，避免多出一段噪声。
+    const hasCtx = !!(lv.size || lv.pct);
+    const pctModel = +lv.pct_model || 0;
+    $("h-ctx").innerHTML = hasCtx
+      ? `${pct(lv.pct)}${pctModel
+          ? `<i class="ctxalt">物理 ${pct(pctModel)}</i>` : ""}`
+      : "—";
+    $("h-ctx").style.color = hasCtx
       ? (lv.pct >= .8 ? "#F6B26B" : "#E7E9ED") : "#767D8A";
 
     // 非 token 单位的读数来自实时会话（lv），基准行也必须用同一口径；
@@ -1804,7 +1828,7 @@
           <span class="pill">${esc(prettyModel(r.model))}</span>
         </div>
         <span class="rrate">${fmtRate(r.out_tps)} t/s</span>
-        <span class="rctx" style="color:${c}">${pct(p, 0)}</span>
+        <span class="rctx" style="color:${c}"${ctxTip(r)}>${pct(p, 0)}</span>
         <div class="ctxbar"><div class="ctxfill" style="width:${Math.min(100, p * 100)}%;background:${c}"></div></div>
         <span class="rage">${ago(r.last_ts)}</span>
       </div>`;
@@ -1916,7 +1940,7 @@
         <td><span class="pill" title="${esc(s.model || "")}">${esc(prettyModel(s.model))}</span></td>
         <td>
           <div class="ctxcell">
-            <span class="ctxpct" style="color:${c}">${(s.size || s.pct) ? pct(p) : "—"}</span>
+            <span class="ctxpct" style="color:${c}"${ctxTip(s)}>${(s.size || s.pct) ? pct(p) : "—"}</span>
             <div class="ctxbar"><div class="ctxfill" style="width:${Math.min(100, p * 100)}%;background:${c}"></div></div>
           </div>
         </td>
@@ -1936,6 +1960,7 @@
   // ---------------------------------------------------------------- 渲染入口
   const SRC_LABEL = {
     workbuddy: "WorkBuddy", qoder: "Qoder", codex: "Codex", claude: "Claude",
+    codebuddy: "CodeBuddy",
   };
 
   function setMetric(m) {
@@ -2098,7 +2123,58 @@
     load();
   });
 
+  // 数据源页签拖动排序：顺序存 localStorage，「自动/全部」固定在左。
+  const SRC_ORDER_KEY = "tm.srcOrder";
+  let srcDragEnded = 0;
+
+  function saveSrcOrder() {
+    const order = [...$("srcTabs").querySelectorAll('.tab[draggable="true"]')]
+      .map((x) => x.dataset.source);
+    try { localStorage.setItem(SRC_ORDER_KEY, JSON.stringify(order)); } catch (_) {}
+  }
+
+  function applySrcOrder() {
+    const bar = $("srcTabs");
+    const tabs = [...bar.querySelectorAll('.tab[draggable="true"]')];
+    let saved = [];
+    try { saved = JSON.parse(localStorage.getItem(SRC_ORDER_KEY) || "[]"); } catch (_) {}
+    if (!Array.isArray(saved) || !saved.length) return;
+    const byId = new Map(tabs.map((t) => [t.dataset.source, t]));
+    const ordered = saved.map((id) => byId.get(id)).filter(Boolean);
+    tabs.forEach((t) => { if (!saved.includes(t.dataset.source)) ordered.push(t); });
+    ordered.forEach((t) => bar.appendChild(t));
+  }
+  applySrcOrder();
+
+  $("srcTabs").addEventListener("dragstart", (e) => {
+    const b = e.target.closest('.tab[draggable="true"]');
+    if (!b) return;
+    e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", b.dataset.source);
+    b.classList.add("dragging");
+  });
+  $("srcTabs").addEventListener("dragover", (e) => {
+    const bar = $("srcTabs");
+    const drag = bar.querySelector(".tab.dragging");
+    if (!drag) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    // 指针越过某个页签的中线就插到它前面，实时重排即是拖拽反馈
+    const before = [...bar.querySelectorAll('.tab[draggable="true"]')]
+      .filter((x) => x !== drag)
+      .find((x) => e.clientX < x.getBoundingClientRect().left + x.offsetWidth / 2);
+    bar.insertBefore(drag, before || null);
+  });
+  $("srcTabs").addEventListener("drop", (e) => e.preventDefault());
+  $("srcTabs").addEventListener("dragend", () => {
+    const b = $("srcTabs").querySelector(".tab.dragging");
+    if (b) b.classList.remove("dragging");
+    srcDragEnded = performance.now();
+    saveSrcOrder();
+  });
+
   $("srcTabs").addEventListener("click", (e) => {
+    if (performance.now() - srcDragEnded < 200) return;
     const b = e.target.closest(".tab");
     if (!b) return;
     document.querySelectorAll("#srcTabs .tab").forEach((x) => x.classList.remove("on"));
@@ -2172,7 +2248,7 @@
         x.classList.toggle("on", x.dataset.scope === s));
     }
     const src = hp.get("source") || qp.get("source");
-    if (src && ["auto", "all", "workbuddy", "qoder", "codex", "claude"].includes(src)) {
+    if (src && ["auto", "all", "workbuddy", "qoder", "codex", "claude", "codebuddy"].includes(src)) {
       source = src;
       document.querySelectorAll("#srcTabs .tab").forEach((x) =>
         x.classList.toggle("on", x.dataset.source === src));

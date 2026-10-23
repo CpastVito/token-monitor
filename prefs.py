@@ -31,7 +31,7 @@ DEFAULTS: Dict[str, Any] = {
     # ---------------- 速率口径
     "basis": "eff",             # eff | raw | base
     # ---------------- 数据源：桌宠查哪个应用的用量
-    # all | workbuddy | qoder | codex | claude（与 collector.sources.SOURCE_IDS 对齐）
+    # all | workbuddy | qoder | codex | claude | codebuddy（与 collector.sources.SOURCE_IDS 对齐）
     "source": "all",
     # ---------------- 提醒
     "alerts": {

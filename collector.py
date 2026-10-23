@@ -8,7 +8,7 @@ WorkBuddy 的数据来源（全部为本地只读文件）：
 
 1. ~/.workbuddy/workbuddy.db
      - sessions       : 会话元数据（标题 / 模型 / 上下文窗口 / 活跃时间）
-     - session_usage  : 实时上下文占用（used / size）
+     - session_usage  : 实时上下文占用（used / size，size 是模型物理窗口）
 2. ~/.workbuddy/projects/**/*.jsonl
      - providerData.rawUsage : 逐请求 prompt_tokens / completion_tokens
                                / prompt_cache_hit_tokens / credit(积分)
@@ -17,7 +17,7 @@ WorkBuddy 的数据来源（全部为本地只读文件）：
        与 JSONL 请求按 (sessionId, endedAt) 对齐，中位误差约 17ms，
        据此计算上下行 tokens/秒（而非按墙钟估算）。
 
-其它应用（Qoder / Codex / Claude Code）由 `sources.py` 负责解析，
+其它应用（Qoder / Codex / Claude Code / CodeBuddy）由 `sources.py` 负责解析，
 产出同构的记录后在这里并入，靠 `src` 字段区分。各家能给什么差别很大 ——
 Qoder 有 credits 但 token 恒为 0，Codex 只有请求数与耗时，Claude 本机无数据 ——
 因此每条记录都带 `src`，`build_summary` 会输出 `by_source` 能力清单，
@@ -33,7 +33,8 @@ UI 据此决定显示真值还是「—」，**不要把缺失当成 0 来展示
 - 下行速率 = completion_tokens ÷ 生成耗时  → 解码吞吐（decode tok/s）
 - 缓存命中率 = prompt_cache_hit_tokens ÷ prompt_tokens
 - 燃烧率 = tokens ÷ 活跃分钟（各会话首尾跨度之和）
-- 上下文占用 = session_usage.used ÷ size
+- 上下文占用 = used ÷ 有效窗口（sessions.context_window，与界面一致）
+             另给物理窗口口径 used ÷ session_usage.size，见 ctx_gauges()
 """
 
 from __future__ import annotations
@@ -506,7 +507,7 @@ def collect_requests(force: bool = False) -> Tuple[List[Dict[str, Any]], Dict[st
                         (float(a), float(b)) for a, b in spans
                     )
 
-        # ---- 其它应用：Qoder / Codex / Claude Code（见 sources.py）
+        # ---- 其它应用：Qoder / Codex / Claude Code / CodeBuddy（见 sources.py）
         # 与 WorkBuddy 共用同一份 (mtime, size) 指纹缓存，键加了 "qoder-log:" 之类
         # 的前缀避免与 WorkBuddy 的绝对路径键撞车。
         extra = sources.collect(old_files)
@@ -670,6 +671,32 @@ def read_db() -> Dict[str, Any]:
     except sqlite3.Error:
         return out
     return out
+
+
+# ---------------------------------------------------------------- 上下文双口径
+
+def ctx_gauges(used: int, model_size: int, ctx_window: int) -> Dict[str, Any]:
+    """
+    上下文占用的双口径换算。
+
+    主口径 size / pct 取 sessions.context_window，即客户端认定的**有效上下文窗口**：
+    WorkBuddy 界面的百分比和自动压缩的触发判定都以它为基准，实测为模型物理上限
+    的 60%。
+
+    副口径 size_model / pct_model 取 session_usage.size，即模型**物理输入上限**
+    （~/.workbuddy/models.json 的 maxInputTokens）。
+
+    混用两者会产生固定倍数偏差（600K vs 1M → 1.67 倍），因此分开暴露、由前端
+    决定展示方式。model_size 与主口径相同时置 0，前端据此决定是否显示副标。
+    """
+    size = ctx_window or model_size or 0
+    extra = model_size if (model_size and model_size != size) else 0
+    return {
+        "size": size,
+        "pct": (used / size) if size else 0.0,
+        "size_model": extra,
+        "pct_model": (used / extra) if extra else 0.0,
+    }
 
 
 # ---------------------------------------------------------------- 速率计算
@@ -991,7 +1018,7 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
     生成聚合结果。
 
     scope  : today | 7d | 30d | all
-    source : all | auto | workbuddy | qoder | codex | claude
+    source : all | auto | workbuddy | qoder | codex | claude | codebuddy
 
     auto 会先解析成"最近 120 秒内有活动的最新源"，再按该源筛选；
     因此 totals / rates / by_model / by_day / by_hour / minute_series /
@@ -1075,7 +1102,7 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
             "avg_ms": (sum(a["durs"]) / a["n"]) if a["n"] else 0.0,
             "p95_ms": _pct(sorted(a["durs"]), 0.95),
             "samples": a["n"],
-            # 同一个模型可能被多个 agent（WorkBuddy/Qoder/Codex/Claude）调用，
+            # 同一个模型可能被多个 agent（WorkBuddy/Qoder/Codex/Claude/CodeBuddy）调用，
             # 按调用次数给出，UI 在模型名后标注来源。
             "srcs": [{"id": k, "n": v} for k, v in
                      sorted(a["srcs"].items(), key=lambda kv: (-kv[1], kv[0]))],
@@ -1208,7 +1235,8 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
             u = usage_meta.get(sid) or {}
             a = sess_agg.get(sid) or {}
             used = u.get("used") or 0
-            size = u.get("size") or meta.get("context_window") or 0
+            g = ctx_gauges(used, u.get("size") or 0,
+                           meta.get("context_window") or 0)
             recs_s = a.get("recs") or []
             dec = decode_stats(recs_s)
             lv = live_stats(recs_s)
@@ -1219,8 +1247,10 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
                     "src": "workbuddy",
                     "model": a.get("model") or meta.get("model"),
                     "used": used,
-                    "size": size,
-                    "pct": (used / size) if size else 0.0,
+                    "size": g["size"],
+                    "pct": g["pct"],
+                    "size_model": g["size_model"],
+                    "pct_model": g["pct_model"],
                     "requests": a.get("requests", 0),
                     "input": a.get("input", 0),
                     "output": a.get("output", 0),
@@ -1235,7 +1265,7 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
                     "status": meta.get("status"),
                 }
             )
-        # 其它源（Qoder / Codex / Claude）没有会话元数据库，直接从记录聚合出行。
+        # 其它源（Qoder / Codex / Claude / CodeBuddy）没有会话元数据库，直接从记录聚合出行。
         # 上下文占用用 Qoder 的 context_usage_ratio（0~1），拿不到 used/size 绝对值。
         have = {s["id"] for s in sessions}
         for sid, a in sess_agg.items():
@@ -1254,6 +1284,8 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
                     "used": 0,
                     "size": 0,
                     "pct": ctx,
+                    "size_model": 0,
+                    "pct_model": 0.0,
                     "requests": a.get("requests", 0),
                     "input": a.get("input", 0),
                     "output": a.get("output", 0),
@@ -1295,7 +1327,8 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
         u = usage_meta[sid_live]
         meta = sessions_meta.get(sid_live) or {}
         a = sess_agg.get(sid_live) or {}
-        size = u["size"] or meta.get("context_window") or 0
+        g = ctx_gauges(u["used"], u["size"],
+                       meta.get("context_window") or 0)
         # all 模式下 recent 混着别的源，WorkBuddy 的实时速率要单独算
         recs_s = a.get("recs") or []
         recs_rate = ([r for r in recent_recs if r.get("src") == "workbuddy"]
@@ -1307,8 +1340,10 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
             "src": "workbuddy",
             "model": a.get("model") or meta.get("model") or "",
             "used": u["used"],
-            "size": size,
-            "pct": (u["used"] / size) if size else 0.0,
+            "size": g["size"],
+            "pct": g["pct"],
+            "size_model": g["size_model"],
+            "pct_model": g["pct_model"],
             "pct_source": "used",
             "session_input": a.get("input", 0),
             "session_output": a.get("output", 0),
@@ -1351,6 +1386,8 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
             "size": 0,
             "pct": ctx,
             "pct_source": "ratio",
+            "size_model": 0,
+            "pct_model": 0.0,
             "session_input": a.get("input", 0),
             "session_output": a.get("output", 0),
             "session_credit": a.get("credit", 0.0),
@@ -1395,7 +1432,8 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
         if meta.get("status") != "working" and (now - last) > 900_000:
             continue
         lv = live_stats(a.get("recs") or [])
-        sz = u.get("size") or meta.get("context_window") or 0
+        g = ctx_gauges(u.get("used") or 0, u.get("size") or 0,
+                       meta.get("context_window") or 0)
         running.append(
             {
                 "id": sid,
@@ -1403,7 +1441,8 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
                 "model": a.get("model") or meta.get("model") or "",
                 "out_tps": lv["out_tps"],
                 "in_tps": lv["in_tps"],
-                "pct": ((u.get("used") or 0) / sz) if sz else 0.0,
+                "pct": g["pct"],
+                "pct_model": g["pct_model"],
                 "requests": a.get("requests", 0),
                 "last_ts": last,
                 "status": meta.get("status") or "",
@@ -1499,10 +1538,15 @@ def one_line(scope: str = "today") -> str:
     dec = s.get("baseline") or {}
     model = live.get("model") or "—"
     pct = live.get("pct") or 0
+    pct_m = live.get("pct_model") or 0
+    # 只在双口径确实不同时才打副标，避免老会话多出一段噪声
+    ctx_s = f"| ctx {pct * 100:.1f}%"
+    if pct_m:
+        ctx_s += f" (物理 {pct_m * 100:.1f}%)"
     return (
         f"{model} | ↓{fmt_rate(r.get('out_tps', 0))}t/s ↑{fmt_rate(r.get('in_tps', 0))}t/s "
         f"| 基线 ↓{fmt_rate(dec.get('out_tps', 0))}t/s "
-        f"| ctx {pct * 100:.1f}% | ↑{fmt_tokens(t['input'])} ↓{fmt_tokens(t['output'])} "
+        f"{ctx_s} | ↑{fmt_tokens(t['input'])} ↓{fmt_tokens(t['output'])} "
         f"| {t['requests']} req | {t['credit']:.2f} credit"
     )
 

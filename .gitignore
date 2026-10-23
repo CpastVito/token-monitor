@@ -8,6 +8,17 @@ overlay-state.json
 *.log
 *.tmp
 
+# 静态快照产物（publish_snapshot.py 生成，含本机用量数据）
+dist/
+
+# 图标流水线下载缓存
+assets/logos/*.bin
+
 # Python
 __pycache__/
 *.py[cod]
+
+# 系统文件
+Thumbs.db
+desktop.ini
+.DS_Store

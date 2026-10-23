@@ -264,7 +264,8 @@ class Sampler:
         self.snap = {
             "model": "", "out_eff": 0.0, "in_eff": 0.0,
             "out_raw": 0.0, "in_raw": 0.0, "out_base": 0.0, "in_base": 0.0,
-            "tool_ratio": 0.0, "pct": 0.0, "used": 0, "size": 0,
+            "tool_ratio": 0.0, "pct": 0.0, "pct_model": 0.0,
+            "used": 0, "size": 0, "size_model": 0,
             "sess_in": 0, "sess_out": 0, "credit": 0.0,
             "today_in": 0, "today_out": 0, "today_req": 0, "today_credit": 0.0,
             "ttft": 0.0, "turn": None, "running": [], "status": "",
@@ -381,8 +382,10 @@ class Sampler:
             # 非 WorkBuddy 源没有 used/size 绝对值，pct 是 context_usage_ratio；
             # 面板按 size 是否为 0 区分两种画法，这里原样透传即可。
             "pct": float(lv.get("pct") or 0.0),
+            "pct_model": float(lv.get("pct_model") or 0.0),
             "used": lv.get("used") or 0,
             "size": lv.get("size") or 0,
+            "size_model": lv.get("size_model") or 0,
             "active": bool(upd) and (now_ms - upd) < 120_000,
             "status": lv.get("status") or "",
             "src": resolved,
@@ -440,8 +443,10 @@ class Sampler:
             prev = dict(self.snap)
         patch = {
             "pct": prev.get("pct", 0.0),
+            "pct_model": prev.get("pct_model", 0.0),
             "used": prev.get("used", 0),
             "size": prev.get("size", 0),
+            "size_model": prev.get("size_model", 0),
             "active": prev.get("active", False),
             "status": prev.get("status", ""),
             "ts": int(time.time() * 1000),
@@ -521,8 +526,12 @@ class Sampler:
                 live_src = lv.get("src") or resolved
                 patch.update(
                     pct=float(lv.get("pct") or 0.0),
+                    pct_model=(float(lv.get("pct_model") or 0.0)
+                               if live_src == "workbuddy" else 0.0),
                     used=(lv.get("used") or 0) if live_src == "workbuddy" else 0,
                     size=(lv.get("size") or 0) if live_src == "workbuddy" else 0,
+                    size_model=((lv.get("size_model") or 0)
+                                if live_src == "workbuddy" else 0),
                     active=bool(upd) and (time.time() * 1000 - upd) < 120_000,
                     status=lv.get("status") or "",
                 )

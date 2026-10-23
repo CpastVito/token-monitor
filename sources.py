@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-多应用数据源（Qoder / Codex / Claude Code）
-==========================================
+多应用数据源（Qoder / Codex / Claude Code / CodeBuddy）
+======================================================
 
 `collector.py` 原本只认 WorkBuddy 一种来源。这里把"还有哪些应用在本地留了用量"
 抽成独立的数据源层，让上层按 `src` 字段筛选，而不用关心各家格式差异。
 
-四家在本机的实测情况（2026-10-21 勘察）：
+五家在本机的实测情况（2026-10-23 勘察）：
 
     workbuddy  ~/.workbuddy            token + credit 都有，由 collector.py 自己解析
     qoder      ~/.qoder-cn             **token 恒为 0**（2108 个字段实例无一非零），
@@ -16,6 +16,8 @@
                                        cc-switch 代理日志可补历史与首字延迟
     claude     ~/.claude               原生 projects JSONL 含真实 token；
                                        cc-switch 代理日志可补历史与首字延迟
+    codebuddy  CodeBuddyExtension      VSCode 插件的对话索引含逐请求
+                                       token / cache / credit / elapsedMs
 
 一手数据（原生 rollout / 转录）优先，cc-switch 只补缺口，合并时按 request_id
 与 (源, 会话, 输入, 输出) 去重。UI 侧靠 `meta[src]["note"]` 说明数据来源与
@@ -44,6 +46,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 HOME = Path.home()
+LOCALAPPDATA = Path(os.environ.get("LOCALAPPDATA") or (HOME / "AppData" / "Local"))
 
 # ---------------------------------------------------------------- 数据源注册表
 
@@ -80,6 +83,14 @@ SOURCES: Dict[str, Dict[str, Any]] = {
         "caps": {"tokens": True, "credits": False, "dur": False, "tools": False},
         "unit": "tokens",
         "note": "原生 projects JSONL 含真实 token；cc-switch 可补历史与首字延迟。",
+    },
+    "codebuddy": {
+        "label": "CodeBuddy",
+        "roots": [LOCALAPPDATA / "CodeBuddyExtension"],
+        "caps": {"tokens": True, "credits": True, "dur": True, "tools": False},
+        "unit": "tokens",
+        "note": "VSCode 插件的会话索引含逐请求 token / cache / credit；"
+                "耗时取消息快照的 elapsedMs（agent 请求包含工具执行等待）。",
     },
 }
 
@@ -754,6 +765,144 @@ def _parse_anthropic_jsonl(p: Path, src: str) -> Dict[str, Any]:
     return {"records": recs}
 
 
+# ---------------------------------------------------------------- CodeBuddy
+
+def _codebuddy_paths() -> List[Path]:
+    """
+    VSCode 插件的对话索引：
+
+        Data/<account>/VSCode/<id>/history/<workspace>/<conversation>/index.json
+
+    `Data/default/...` 是未登录时的账本，目录层级相同，同一个通配即可覆盖。
+    """
+    out: List[Path] = []
+    for root in _roots("codebuddy"):
+        data = root / "Data"
+        if data.exists():
+            out.extend(sorted(map(Path, glob.glob(
+                str(data / "*" / "VSCode" / "*" / "history" / "*" / "*" / "index.json")))))
+    return out
+
+
+def _cb_extra(path: Path) -> Dict[str, Any]:
+    """消息文件里的 `extra`（按字符串落盘）→ dict；模型名与耗时都在这里。"""
+    try:
+        d = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return {}
+    ex = d.get("extra")
+    if isinstance(ex, str):
+        try:
+            ex = json.loads(ex)
+        except ValueError:
+            return {}
+    return ex if isinstance(ex, dict) else {}
+
+
+def _cb_conv_model(p: Path) -> str:
+    """消息文件缺失时兜底：workspace 索引里记着对话当前选中的模型。"""
+    try:
+        d = json.loads((p.parent.parent / "index.json").read_text(
+            encoding="utf-8", errors="ignore"))
+    except Exception:
+        return ""
+    for c in d.get("conversations") or []:
+        if isinstance(c, dict) and c.get("id") == p.parent.name:
+            return str(c.get("selectedModelId") or "")
+    return ""
+
+
+def _parse_codebuddy_history(p: Path) -> Dict[str, Any]:
+    """
+    每个对话一份 index.json：
+
+        requests[].usage         逐请求汇总值（input/output/cache/credit）
+        messages[]               message-id → role
+        messages/<assistant>.json extra.modelName + statsSnapshot.elapsedMs
+
+    模型与耗时按请求关联到最后一条 assistant 消息；取不到就退回会话级模型。
+    """
+    recs: List[Dict[str, Any]] = []
+    try:
+        doc = json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return {"records": recs}
+
+    roles: Dict[str, str] = {}
+    for m in doc.get("messages") or []:
+        if isinstance(m, dict) and m.get("id"):
+            roles[str(m["id"])] = str(m.get("role") or "")
+
+    sid = p.parent.name
+    conv_model: Optional[str] = None
+    for req in doc.get("requests") or []:
+        if not isinstance(req, dict):
+            continue
+        u = req.get("usage")
+        if not isinstance(u, dict):
+            continue
+        try:
+            inp = int(u.get("inputTokens") or 0)
+            outp = int(u.get("outputTokens") or 0)
+            cached = int(u.get("cacheTokens") or 0)
+            credit = float(u.get("credit") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if inp + outp <= 0 and credit <= 0:
+            continue
+
+        model, dur, reasoning = "", 0, 0
+        for mid in reversed([str(x) for x in (req.get("messages") or [])]):
+            if roles.get(mid) != "assistant":
+                continue
+            ex = _cb_extra(p.parent / "messages" / f"{mid}.json")
+            if not ex:
+                continue
+            model = str(ex.get("modelName") or ex.get("modelId") or "")
+            snap = ex.get("statsSnapshot")
+            if isinstance(snap, dict):
+                try:
+                    dur = int(snap.get("elapsedMs") or 0)
+                    reasoning = int(snap.get("thinkingTokens") or 0)
+                except (TypeError, ValueError):
+                    pass
+            break
+        if not model:
+            if conv_model is None:
+                conv_model = _cb_conv_model(p)
+            model = conv_model
+
+        recs.append(_rec(
+            "codebuddy", float(req.get("startedAt") or 0), sid, _canon_model(model),
+            rid=str(req.get("id") or ""),
+            **{"in": inp, "out": outp, "cached": cached, "reasoning": reasoning,
+               "credit": credit, "dur": dur, "exact_ms": dur, "data_src": "native"},
+        ))
+    return {"records": recs}
+
+
+def _collect_codebuddy(old: Dict[str, Any]) -> Dict[str, Any]:
+    out = {"records": [], "calls": [], "rets": [], "files": {}, "dirty": False}
+    seen: set = set()
+    for p in _codebuddy_paths():
+        key = "codebuddy:" + str(p)
+        hit = _cache_hit(old, p, key)
+        if hit is None:
+            item = _parse_codebuddy_history(p)
+            out["dirty"] = True
+        else:
+            item = hit
+        out["files"][key] = _entry(p, item)
+        for r in item.get("records") or []:
+            # 同一账号的对话偶尔会同时出现在 default 与具名账号目录下
+            dedup = r.get("rid") or (r.get("sid"), r.get("ts"), r.get("in"), r.get("out"))
+            if dedup in seen:
+                continue
+            seen.add(dedup)
+            out["records"].append(r)
+    return out
+
+
 # ---------------------------------------------------------------- cc-switch 回退
 
 CC_DB = HOME / ".cc-switch" / "cc-switch.db"
@@ -918,6 +1067,7 @@ _COLLECTORS = {
     "qoder": _collect_qoder,
     "codex": _collect_codex,
     "claude": _collect_claude,
+    "codebuddy": _collect_codebuddy,
 }
 
 
@@ -1015,4 +1165,6 @@ def _empty_reason(sid: str, detected: bool) -> str:
                     "（projects 下只剩 reason=delete 的墓碑文件，sessions/ 为空）。"
                     "若改用 Claude Code CLI，转录会带真实 token 并自动出现在这里。")
         return "本机无数据：未找到任何会话转录。"
+    if sid == "codebuddy":
+        return "本机无数据：CodeBuddy 插件的对话索引里还没有可解析的 usage。"
     return "本机无数据。"
