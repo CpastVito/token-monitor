@@ -119,7 +119,7 @@ def _dashboard_bytes() -> bytes:
 
 # 源参数直接进 build_summary 并参与缓存键，必须白名单校验：
 # 既防注入，也防一个拼错的 source 把缓存撑成一堆永不命中的条目。
-_VALID_SOURCES = ("all",) + tuple(collector.sources.SOURCE_IDS)
+_VALID_SOURCES = ("all", "auto") + tuple(collector.sources.SOURCE_IDS)
 
 
 def _valid_source(v: str) -> str:
@@ -202,6 +202,8 @@ class Handler(BaseHTTPRequestHandler):
                     {
                         "generatedAt": data["generatedAt"],
                         "source": data.get("source", "all"),
+                        "requested_source": data.get("requested_source", "all"),
+                        "units": data.get("units") or {},
                         "by_source": data.get("by_source") or [],
                         "live": data["live"],
                         "today": data["today"],

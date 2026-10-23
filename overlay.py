@@ -26,6 +26,7 @@ import time
 import urllib.request
 import webbrowser
 from pathlib import Path
+import tkinter.font as tkfont
 from tkinter import (BooleanVar, Canvas, DoubleVar, Frame, Label,
                      PhotoImage, StringVar, Tk, Toplevel)
 
@@ -71,8 +72,8 @@ STATE_FILE = BASE_DIR / "overlay-state.json"
 LOGOS = BASE_DIR / "assets" / "logos"
 
 # 数据源：右键菜单里"查哪个软件"的选项。顺序即菜单顺序，"全部"置顶。
-_SOURCE_IDS = ("all",) + tuple(collector.sources.SOURCE_IDS)
-_SOURCE_LABELS = {"all": "全部应用"}
+_SOURCE_IDS = ("auto", "all") + tuple(collector.sources.SOURCE_IDS)
+_SOURCE_LABELS = {"auto": "自动跟随", "all": "全部应用"}
 _SOURCE_LABELS.update({k: v["label"] for k, v in collector.sources.SOURCES.items()})
 
 # ---------------------------------------------------------------- 视觉令牌
@@ -220,7 +221,7 @@ def _pretty(m: str) -> str:
     segs = m.split("-")
     known = {"deepseek": "DeepSeek", "kimi": "Kimi", "glm": "GLM", "gemini": "Gemini",
              "hy": "HY", "space": "Space", "bunny": "Bunny", "qwen": "Qwen",
-             "gpt": "GPT", "claude": "Claude"}
+             "gpt": "GPT", "claude": "Claude", "minimax": "MiniMax"}
     head = segs[0].lower() if segs else ""
     if segs:
         segs[0] = known.get(head, segs[0][:1].upper() + segs[0][1:] if segs[0] else segs[0])
@@ -257,9 +258,9 @@ def _fetch_live(source: str) -> dict | None:
 
 
 class Sampler:
-    def __init__(self, source: str = "all"):
+    def __init__(self, source: str = "auto"):
         self.lock = threading.Lock()
-        self.source = source if source in _SOURCE_IDS else "all"
+        self.source = source if source in _SOURCE_IDS else "auto"
         self.snap = {
             "model": "", "out_eff": 0.0, "in_eff": 0.0,
             "out_raw": 0.0, "in_raw": 0.0, "out_base": 0.0, "in_base": 0.0,
@@ -271,12 +272,17 @@ class Sampler:
             # 多源：当前查的是哪个应用，以及"有没有数可显示"。
             # has_* 是**数据驱动**而非能力驱动 —— Claude 虽然理论上能记 token，
             # 但本机一条记录都没有，此时也该显示「—」而不是 0。
-            "src": self.source, "src_label": _SOURCE_LABELS.get(self.source, "全部"),
-            "has_tokens": True, "has_credits": False,
+            "src": self.source, "requested_src": self.source,
+            "src_label": _SOURCE_LABELS.get(self.source, "全部"),
+            "has_tokens": True, "has_credits": False, "unit": "tokens",
+            "credit_per_min": 0.0, "credit_per_req": 0.0, "req_per_min": 0.0,
+            "recent_req": 0, "ttft_est": True,
             "sess_req": 0, "src_note": "",
         }
         self._stop = False
         self._force = False
+        self._srv_miss = 0
+        self._srv_try_ts = 0.0
 
     def set_source(self, source: str) -> None:
         src = source if source in _SOURCE_IDS else "all"
@@ -284,7 +290,7 @@ class Sampler:
         self._force = True          # 让下一轮立刻做完整汇总，别等 tick%4
         # 标签先换掉：采样间隔 2s，否则切完来源标题还挂着旧应用名
         with self.lock:
-            self.snap.update({"src": src,
+            self.snap.update({"src": src, "requested_src": src,
                               "src_label": _SOURCE_LABELS.get(src, "全部应用")})
 
     def start(self):
@@ -298,11 +304,17 @@ class Sampler:
                 data = _fetch_live(src)
                 if data is not None:
                     # 服务在线：直接消费聚合结果，每轮都是新鲜的（服务端 TTL 1.2s）
+                    self._srv_miss = 0
                     patch = self._patch_from_live(data, src)
                 else:
                     # 服务不在：本地采集。db 每轮读（轻量），全量汇总每 4 轮一次
                     patch = self._collect_local(src, tick)
                     tick += 1
+                    # 开机自启只拉起桌宠，服务没人管；连续几轮取不到数据就
+                    # 自己把 server.py 拉起来，否则面板会一直停在本地兜底口径。
+                    self._srv_miss += 1
+                    if self._srv_miss >= 3:
+                        self._maybe_start_server()
                 if patch:
                     with self.lock:
                         self.snap.update(patch)
@@ -310,6 +322,32 @@ class Sampler:
                 if os.environ.get("WB_MONITOR_DEBUG"):
                     print("[sampler]", exc, file=sys.stderr)
             time.sleep(2.0)
+
+    def _maybe_start_server(self) -> None:
+        now = time.time()
+        if now - self._srv_try_ts < 60:
+            return
+        self._srv_try_ts = now
+        try:
+            import socket
+            with socket.create_connection(("127.0.0.1", prefs.read_port()),
+                                          timeout=0.35):
+                return
+        except OSError:
+            pass
+        try:
+            import subprocess
+            exe = Path(sys.executable)
+            pyw = exe.with_name("pythonw.exe")
+            subprocess.Popen(
+                [str(pyw if pyw.exists() else exe),
+                 str(BASE_DIR / "server.py"), "--no-browser"],
+                cwd=str(BASE_DIR),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                close_fds=True,
+            )
+        except Exception:
+            pass
 
     def _patch_from_live(self, data: dict, src: str) -> dict:
         """把 /api/live 的响应映射成面板快照（与本地采集口径完全一致）。"""
@@ -324,7 +362,20 @@ class Sampler:
         h = hist.get(model) or {}
         rate_src = rc if (rc.get("samples") or 0) > 0 else rt
         bysrc = {b["id"]: b for b in (data.get("by_source") or [])}
-        pool = list(bysrc.values()) if src == "all" else [bysrc.get(src) or {}]
+        # auto/all 由服务端解析出当前真正活跃的源；单位跟着**实时会话**走，
+        # 否则 all 模式下 Qoder 正在跑时，面板仍按 WorkBuddy 的 tokens 口径
+        # 显示 0 t/s（看起来像没反应）。
+        resolved = data.get("source") or ("all" if src in ("all", "auto") else src)
+        units = data.get("units") or {}
+        unit = lv.get("unit") or units.get("primary") or ""
+        if unit not in ("tokens", "credits", "requests"):
+            unit = "tokens"
+        label = _SOURCE_LABELS.get(resolved, "全部")
+        if src == "auto":
+            label = "自动 · " + label
+        # all 模式下 recent 混着别的源，必须用服务端解析出的实时会话速率；
+        # 手动选源时用 recent 以与仪表盘口径保持一致（含"最近 N 次"回退）。
+        use_lv = src == "all" and bool(lv) and unit == "tokens"
         upd = float(lv.get("updated_at") or 0)
         return {
             # 非 WorkBuddy 源没有 used/size 绝对值，pct 是 context_usage_ratio；
@@ -334,12 +385,15 @@ class Sampler:
             "size": lv.get("size") or 0,
             "active": bool(upd) and (now_ms - upd) < 120_000,
             "status": lv.get("status") or "",
-            "src": src,
-            "src_label": _SOURCE_LABELS.get(src, "全部"),
+            "src": resolved,
+            "requested_src": src,
+            "src_label": label,
             "ts": int(now_ms),
             "model": model,
-            "out_eff": rate_src.get("out_tps", 0.0),
-            "in_eff": rate_src.get("in_tps", 0.0),
+            "out_eff": (lv.get("out_tps", 0.0) if use_lv
+                        else rate_src.get("out_tps", 0.0)),
+            "in_eff": (lv.get("in_tps", 0.0) if use_lv
+                       else rate_src.get("in_tps", 0.0)),
             "out_raw": rc.get("raw_out_tps") or rt.get("raw_out_tps", 0.0),
             "in_raw": rc.get("raw_in_tps") or rt.get("raw_in_tps", 0.0),
             "tool_ratio": rt.get("tool_ratio", 0.0),
@@ -353,42 +407,45 @@ class Sampler:
             "today_out": td.get("output", 0),
             "today_req": td.get("requests", 0),
             "today_credit": td.get("credit", 0.0),
-            "ttft": (data.get("ttft") or {}).get("ttft_ms", 0.0),
+            "ttft": (lv.get("ttft") if lv.get("ttft") is not None
+                     else (data.get("ttft") or {}).get("ttft_ms", 0.0)),
+            "ttft_est": bool(lv.get("ttft_est")
+                             if lv.get("ttft_est") is not None
+                             else (data.get("ttft") or {}).get("estimated", True)),
             "turn": data.get("turn"),
             "running": data.get("running") or [],
-            "stale": (rc.get("samples") or 0) == 0,
-            "has_tokens": any((b.get("input") or 0) + (b.get("output") or 0)
-                              for b in pool),
-            "has_credits": any(b.get("credits") or 0 for b in pool),
-            "src_note": ((bysrc.get(src) or {}).get("note", "")
-                         if src != "all" else ""),
+            "unit": unit,
+            "credit_per_min": float(lv.get("credit_per_min")
+                                    or rate_src.get("credit_per_min") or 0.0),
+            "credit_per_req": float(lv.get("credit_per_req")
+                                    or rate_src.get("credit_per_req") or 0.0),
+            "req_per_min": float(lv.get("req_per_min")
+                                 or rate_src.get("req_per_min") or 0.0),
+            "recent_req": int(lv.get("recent_requests")
+                              or rate_src.get("requests") or 0),
+            # "stale" 只表示近期没有任何请求；token 源没有 token 样本并不等于空闲
+            "stale": (rc.get("requests") or 0) < 1,
+            "has_tokens": unit == "tokens",
+            "has_credits": unit == "credits",
+            "src_note": (bysrc.get(resolved) or {}).get("note", "")
+                        if resolved != "all" else "",
         }
 
     def _collect_local(self, src: str, tick: int) -> dict:
         """服务不可用时的本地采集路径（原实现）。"""
-        wb = src in ("all", "workbuddy")
-        pct = used = size = 0
-        active = False
-        status = ""
-        if wb:
-            # 实时上下文占用只有 WorkBuddy 的 db 里有（session_usage 表）
-            db = collector.read_db()
-            usage = db["usage"]
-            sessions = db["sessions"]
-            sid = max(usage, key=lambda k: usage[k]["updated_at"]) if usage else None
-            if sid:
-                u = usage[sid]
-                m = sessions.get(sid) or {}
-                size = u["size"] or m.get("context_window") or 0
-                used = u["used"]
-                pct = (used / size) if size else 0.0
-                active = (time.time() * 1000 - u["updated_at"]) < 120_000
-                status = m.get("status") or ""
-
-        patch = {"pct": pct, "used": used, "size": size,
-                 "active": active, "status": status, "src": src,
-                 "src_label": _SOURCE_LABELS.get(src, "全部"),
-                 "ts": int(time.time() * 1000)}
+        # 快速轮次（每 2s）不重新汇总，但也不能把上一轮的状态清零：
+        # 之前这里每轮写回 active=False / pct=0，只有每 4 轮才恢复一次，
+        # 面板大部分时间因此显示「空闲 / 上下文 –」。
+        with self.lock:
+            prev = dict(self.snap)
+        patch = {
+            "pct": prev.get("pct", 0.0),
+            "used": prev.get("used", 0),
+            "size": prev.get("size", 0),
+            "active": prev.get("active", False),
+            "status": prev.get("status", ""),
+            "ts": int(time.time() * 1000),
+        }
 
         if tick % 4 == 0 or self._force:
             self._force = False
@@ -404,11 +461,25 @@ class Sampler:
             h = hist.get(model) or {}
             rate_src = rc if (rc.get("samples") or 0) > 0 else rt
             bysrc = {b["id"]: b for b in (s.get("by_source") or [])}
-            pool = list(bysrc.values()) if src == "all" else [bysrc.get(src) or {}]
+            resolved = s.get("source") or ("all" if src in ("all", "auto") else src)
+            units = s.get("units") or {}
+            unit = lv.get("unit") or units.get("primary") or ""
+            if unit not in ("tokens", "credits", "requests"):
+                unit = "tokens"
+            label = _SOURCE_LABELS.get(resolved, "全部")
+            if src == "auto":
+                label = "自动 · " + label
+            # 本地采集同样要报告"解析后的源"，否则 auto 在离线时标题会对不上
             patch.update(
                 model=model,
-                out_eff=rate_src.get("out_tps", 0.0),
-                in_eff=rate_src.get("in_tps", 0.0),
+                src=resolved,
+                requested_src=src,
+                src_label=label,
+                unit=unit,
+                out_eff=(lv.get("out_tps", 0.0) if (src == "all" and lv
+                         and unit == "tokens") else rate_src.get("out_tps", 0.0)),
+                in_eff=(lv.get("in_tps", 0.0) if (src == "all" and lv
+                        and unit == "tokens") else rate_src.get("in_tps", 0.0)),
                 out_raw=rc.get("raw_out_tps") or rt.get("raw_out_tps", 0.0),
                 in_raw=rc.get("raw_in_tps") or rt.get("raw_in_tps", 0.0),
                 tool_ratio=rt.get("tool_ratio", 0.0),
@@ -422,22 +493,39 @@ class Sampler:
                 today_out=td.get("output", 0),
                 today_req=td.get("requests", 0),
                 today_credit=td.get("credit", 0.0),
-                ttft=(s.get("ttft") or {}).get("ttft_ms", 0.0),
+                ttft=(lv.get("ttft") if lv.get("ttft") is not None
+                      else (s.get("ttft") or {}).get("ttft_ms", 0.0)),
+                ttft_est=bool(lv.get("ttft_est")
+                              if lv.get("ttft_est") is not None
+                              else (s.get("ttft") or {}).get("estimated", True)),
                 turn=s.get("turn"),
                 running=s.get("running") or [],
-                stale=(rc.get("samples") or 0) == 0,
-                has_tokens=any((b.get("input") or 0) + (b.get("output") or 0)
-                               for b in pool),
-                has_credits=any(b.get("credits") or 0 for b in pool),
-                src_note=((bysrc.get(src) or {}).get("note", "")
-                          if src != "all" else ""),
+                credit_per_min=float(lv.get("credit_per_min")
+                                     or rate_src.get("credit_per_min") or 0.0),
+                credit_per_req=float(lv.get("credit_per_req")
+                                     or rate_src.get("credit_per_req") or 0.0),
+                req_per_min=float(lv.get("req_per_min")
+                                  or rate_src.get("req_per_min") or 0.0),
+                recent_req=int(lv.get("recent_requests")
+                               or rate_src.get("requests") or 0),
+                stale=(rc.get("requests") or 0) < 1,
+                has_tokens=unit == "tokens",
+                has_credits=unit == "credits",
+                src_note=((bysrc.get(resolved) or {}).get("note", "")
+                          if resolved != "all" else ""),
             )
-            if not wb and lv:
-                # 非 WorkBuddy 源没有 session_usage 表：上下文占用改用记录里的
-                # context_usage_ratio（Qoder 直接给 0~1），活跃与否看最后请求时间。
-                patch["pct"] = float(lv.get("pct") or 0.0)
-                patch["active"] = (
-                    time.time() * 1000 - (lv.get("updated_at") or 0)) < 120_000
+            if lv:
+                # 上下文/活跃状态跟着**解析后的实时源**走。all 模式下实时会话
+                # 可能是 Qoder，不能拿 WorkBuddy 的 used/size 去冒充。
+                upd = float(lv.get("updated_at") or 0)
+                live_src = lv.get("src") or resolved
+                patch.update(
+                    pct=float(lv.get("pct") or 0.0),
+                    used=(lv.get("used") or 0) if live_src == "workbuddy" else 0,
+                    size=(lv.get("size") or 0) if live_src == "workbuddy" else 0,
+                    active=bool(upd) and (time.time() * 1000 - upd) < 120_000,
+                    status=lv.get("status") or "",
+                )
         return patch
 
     def get(self):
@@ -456,7 +544,7 @@ class Panel:
         ("today", "今日"), ("bal", "余额"), ("multi", "并行"),
     ]
 
-    def __init__(self, root: Tk, on_pin_toggle=None):
+    def __init__(self, root: Tk, on_pin_toggle=None, on_balance_refresh=None):
         self.root = root
         self.win = Toplevel(root)
         self.win.withdraw()
@@ -468,10 +556,13 @@ class Panel:
         except Exception:
             pass
         self.on_pin_toggle = on_pin_toggle
+        self.on_balance_refresh = on_balance_refresh
         self.pinned = False
         self._logo_cache = {}
         self._bal_sig = None
         self.bal_rows = 0
+        self.bal_btn = None
+        self.bal_refreshing = False
         self._last = None
         ut.resolve_fonts(self.root)      # 按本机字体族定字阶
         self._build()
@@ -494,8 +585,16 @@ class Panel:
             k = 1.0
         return max(0.9, min(2.0, round(k * 4) / 4))
 
+    def _unit_dx(self, text: str) -> int:
+        """数值右侧要给单位留出的宽度（按当前字体实测）。"""
+        try:
+            return self._unit_font.measure(text) + self.unit_gap
+        except Exception:
+            return self.rate_dx
+
     def _build(self):
         self.bal_rows = max(0, int(getattr(self, "bal_rows", 0)))
+        self.bal_btn = None
         c = Canvas(self.win, bg=KEY, highlightthickness=0, bd=0)
         c.pack()
         self.cv = c
@@ -514,6 +613,13 @@ class Panel:
         self.ctx_x2 = self.width - self.pad - S(11) - S(34)
         self.ctx_dy = S(9)
         f = ut.FONTS or ut.resolve_fonts(self.win)
+        # 单位宽度按实际字形量，不能写死：req/min 比 t/s 宽得多，
+        # 固定让位 22px 时 "req" 会压在数字上（截图里的 6.0 与 req 重叠）。
+        try:
+            self._unit_font = tkfont.Font(root=self.win, font=f["tiny"])
+        except Exception:
+            self._unit_font = None
+        self.unit_gap = S(4)
 
         x0 = self.pad                                  # 内容左边界
         x1 = self.width - self.pad                     # 内容右边界
@@ -626,6 +732,21 @@ class Panel:
             y += S(14)
             c.create_text(x0, y, anchor="nw", text="余额", fill=FG_FAINT,
                           font=f["tiny"], tags="lbl_bal")
+            # 小刷新按钮：和「余额」同一行，靠右；点击只刷新余额，不改钉住状态
+            bw, bh = S(52), S(20)
+            bx0, by = x1 - bw, y - S(2)
+            self.bal_btn = (bx0, by, x1, by + bh)
+            refreshing = bool(getattr(self, "bal_refreshing", False))
+            ut.round_rect(c, bx0, by, x1, by + bh, S(6),
+                          fill=ut.CARD, outline="",
+                          tags=("balrefresh", "balrefresh_bg"))
+            c.create_text((bx0 + x1) / 2, by + bh / 2 - S(1),
+                          text="刷新中" if refreshing else "刷新",
+                          fill=FG_FAINT if refreshing else FG_IN,
+                          font=f["tiny"], tags=("balrefresh", "balrefresh_t"))
+            c.bind("<Button-1>", self._on_panel_click)
+            c.bind("<Motion>", self._on_panel_motion)
+            c.bind("<Leave>", self._on_panel_leave)
             y += S(16)
             self.row_y["bal"] = y
             y += (S(self.BAL_CARD_H) * self.bal_rows
@@ -681,37 +802,96 @@ class Panel:
         c.itemconfig("dot", fill=FG_OK if live else FG_FAINT)
         c.itemconfig("halo", fill=ut.TINT_OK if live else ut.WELL)
 
-        if basis == "base":
-            o, i = s["out_base"], s["in_base"]
-        elif basis == "raw":
-            o, i = s["out_raw"], s["in_raw"]
+        unit = s.get("unit") or ("tokens" if has_tok else
+                                 "credits" if has_cred else "")
+        lbl_out, lbl_in = "下行 · 输出", "上行 · 输入"
+        u_out = u_in = "t/s"
+        if unit == "credits":
+            lbl_out, lbl_in = "积分 · 每分钟", "请求 · 每分钟"
+            u_out, u_in = "cr/min", "req/min"
+            o = float(s.get("credit_per_min") or 0.0)
+            i = float(s.get("req_per_min") or 0.0)
+        elif unit == "requests":
+            lbl_out, lbl_in = "请求 · 每分钟", "上行 · 输入"
+            u_out = "req/min"
+            o = float(s.get("req_per_min") or 0.0)
+            i = 0.0
+        elif unit == "tokens":
+            if basis == "base":
+                o, i = s["out_base"], s["in_base"]
+            elif basis == "raw":
+                o, i = s["out_raw"], s["in_raw"]
+            else:
+                o, i = s["out_eff"], s["in_eff"]
         else:
-            o, i = s["out_eff"], s["in_eff"]
-        if has_tok:
-            c.itemconfig(self.items["out"], text=_rate(o), fill=FG_OUT)
-            c.itemconfig(self.items["in"], text=_rate(i), fill=FG_IN)
-            for k in ("out", "in"):
-                c.itemconfig(f"unit_{k}", state="normal")
-                c.coords(self.items[k], self.val_x1 - self.rate_dx,
-                         self.row_y[k] + self.rate_dy)
-            c.itemconfig(self.items["raw"],
-                         text=f"{_rate(s['out_raw'])} t/s · 工具 {s['tool_ratio'] * 100:.0f}%")
-            c.itemconfig(self.items["base"], text=f"{_rate(s['out_base'])} t/s")
+            o = i = 0.0
+
+        c.itemconfig("lbl_out", text=lbl_out)
+        c.itemconfig("lbl_in", text=lbl_in,
+                     state="normal" if unit in ("tokens", "credits") else "hidden")
+        c.itemconfig("unit_out", text=u_out)
+        c.itemconfig("unit_in", text=u_in)
+
+        if unit in ("tokens", "credits", "requests"):
+            dx_o = self._unit_dx(u_out)
+            dx_i = self._unit_dx(u_in)
+            c.itemconfig(self.items["out"],
+                         text=_rate(o), fill=FG_OUT if o else FG_FAINT)
+            c.itemconfig(f"unit_out", state="normal")
+            c.coords(self.items["out"], self.val_x1 - dx_o,
+                     self.row_y["out"] + self.rate_dy)
+            if unit in ("tokens", "credits"):
+                c.itemconfig(self.items["in"],
+                             text=_rate(i), fill=FG_IN if i else FG_FAINT)
+                c.itemconfig("unit_in", state="normal")
+                c.coords(self.items["in"], self.val_x1 - dx_i,
+                         self.row_y["in"] + self.rate_dy)
+            else:
+                c.itemconfig(self.items["in"], text="—", fill=FG_FAINT)
+                c.itemconfig("unit_in", state="hidden")
+                c.coords(self.items["in"], self.val_x1,
+                         self.row_y["in"] + self.rate_dy)
+
+            if unit == "tokens":
+                c.itemconfig("lbl_raw", text="端到端")
+                c.itemconfig(self.items["raw"],
+                             text=f"{_rate(s['out_raw'])} t/s · 工具 {s['tool_ratio'] * 100:.0f}%",
+                             fill=FG)
+                c.itemconfig("lbl_base", text="生成基线")
+                c.itemconfig(self.items["base"],
+                             text=f"{_rate(s['out_base'])} t/s", fill=FG)
+            elif unit == "credits":
+                c.itemconfig("lbl_raw", text="每次请求")
+                c.itemconfig(self.items["raw"],
+                             text=f"{float(s.get('credit_per_req') or 0):.2f} cr",
+                             fill=FG)
+                c.itemconfig("lbl_base", text="近期请求")
+                c.itemconfig(self.items["base"],
+                             text=f"{int(s.get('recent_req') or 0)} 次", fill=FG)
+            else:
+                c.itemconfig("lbl_raw", text="近期请求")
+                c.itemconfig(self.items["raw"],
+                             text=f"{int(s.get('recent_req') or 0)} 次", fill=FG)
+                c.itemconfig("lbl_base", text="生成基线")
+                c.itemconfig(self.items["base"], text="—", fill=FG_FAINT)
         else:
-            # 该源没有 token 数（Qoder 只回传 credits，Codex 本地无 usage）。
-            # 一律「—」：写成 0 t/s 会被读成"生成很慢"，而真相是"没有这项数据"。
+            # 没有可显示的单位时一律「—」：写成 0 t/s 会被读成"生成很慢"，
+            # 而真相是"没有这项数据"。
             for k in ("out", "in", "raw", "base"):
                 c.itemconfig(self.items[k], text="—", fill=FG_FAINT)
-            # 没有 token 的源连单位一起收起，避免出现"— t/s"；
-            # 数值同时回到右边缘，否则"上电态"和"无数据态"的右边界会差 24px
+            c.itemconfig("lbl_raw", text="端到端")
+            c.itemconfig("lbl_base", text="生成基线")
+            # 单位一起收起，避免出现"— t/s"；数值回到右边缘，保证右边界对齐
             for k in ("out", "in"):
                 c.itemconfig(f"unit_{k}", state="hidden")
                 c.coords(self.items[k], self.val_x1, self.row_y[k] + self.rate_dy)
 
         ttft = s.get("ttft") or 0
+        est = bool(s.get("ttft_est", True))
         c.itemconfig(self.items["ttft"],
-                     text=(f"{ttft / 1000:.1f}s" if ttft >= 1000 else
-                           f"{ttft:.0f}ms") if ttft else "—")
+                     text=(f"{'≈' if est else ''}"
+                           + (f"{ttft / 1000:.1f}s" if ttft >= 1000
+                              else f"{ttft:.0f}ms")) if ttft else "—")
 
         pct = float(s.get("pct") or 0)
         bar, txt = self.items["ctx"]
@@ -875,6 +1055,49 @@ class Panel:
                           tags="balchip")
         return False
 
+    # ---------------- 余额刷新按钮
+    def _refresh_hit(self, x: int, y: int) -> bool:
+        if not self.bal_btn:
+            return False
+        x0, y0, x1, y1 = self.bal_btn
+        return x0 <= x <= x1 and y0 <= y <= y1
+
+    def _on_panel_motion(self, e):
+        if self.bal_refreshing:
+            self.cv.configure(cursor="watch")
+            self.cv.itemconfig("balrefresh_bg", fill=ut.CARD)
+        elif self._refresh_hit(e.x, e.y):
+            self.cv.configure(cursor="hand2")
+            self.cv.itemconfig("balrefresh_bg", fill=ut.TINT_IN)
+        else:
+            self.cv.configure(cursor="")
+            self.cv.itemconfig("balrefresh_bg", fill=ut.CARD)
+
+    def _on_panel_leave(self, _e):
+        if not self.bal_btn:
+            return
+        self.cv.configure(cursor="")
+        self.cv.itemconfig("balrefresh_bg", fill=ut.CARD)
+
+    def _on_panel_click(self, e):
+        if self.bal_refreshing or not self._refresh_hit(e.x, e.y):
+            return
+        if self.on_balance_refresh:
+            self.on_balance_refresh()
+
+    def set_balance_refreshing(self, on: bool):
+        self.bal_refreshing = bool(on)
+        if not self.bal_btn:
+            return
+        try:
+            self.cv.itemconfig("balrefresh_t",
+                               text="刷新中" if on else "刷新",
+                               fill=FG_FAINT if on else FG_IN)
+            self.cv.itemconfig("balrefresh_bg", fill=ut.CARD)
+            self.cv.configure(cursor="watch" if on else "")
+        except Exception:
+            pass
+
     # ---------------- 显示控制
     def show_at(self, px: int, py: int, pet_w: int, pet_h: int):
         w, h = self.width, self.height
@@ -899,6 +1122,16 @@ class Panel:
 
     def visible(self) -> bool:
         return bool(self.win.winfo_ismapped())
+
+    def contains(self, x: int, y: int) -> bool:
+        """指针是否在面板窗口内（用于把面板本身也算作悬停区）。"""
+        if not self.visible():
+            return False
+        try:
+            wx, wy = self.win.winfo_rootx(), self.win.winfo_rooty()
+            return wx <= x < wx + self.width and wy <= y < wy + self.height
+        except Exception:
+            return False
 
 
 # ---------------------------------------------------------------- 主程序
@@ -940,7 +1173,7 @@ class PetApp:
         if self.source not in _SOURCE_IDS:
             self.source = "all"
         self.sampler = Sampler(self.source)
-        self.panel = Panel(self.root)
+        self.panel = Panel(self.root, on_balance_refresh=self.refresh_balances_now)
         self.bubble = Bubble(self.root)
 
         self.basis = cfg.get("basis", "eff")
@@ -952,13 +1185,18 @@ class PetApp:
         self._alpha_ts = 0
         self._balances = []
         self._balance_ts = 0
+        self._bal_refreshing = False
+        self._bal_refresh_result = None
+        self._bal_refresh_deadline = 0.0
         self._alert_ts = {}
         self._credit_band = 0      # 今日积分已提示到第几档（防止每 5 分钟重复弹）
         self._last_turn_ts = 0
         self._look_ts = 0
         self._looking = False
         self._look_near = False     # 注视回滞状态
+        self._look_t = None         # 平滑后的注视角度
         self._dir_idx = -1
+        self._wander_defer_start = 0.0
         self._cfg_mtime = self._mtime()
         self._wander_job = None
         self._walk_dir = 0
@@ -1080,6 +1318,11 @@ class PetApp:
         else:
             self._credit_band = 0      # 跨天或调高阈值后重新计档
 
+        # 漫步/注视时动画帧由各自的状态机独占；否则 WORK/WAIT/OK 会把
+        # 走路帧或注视帧抢掉，看起来"走一半突然原地跑步"。
+        if self._walk_dir or self._looking:
+            return
+
         # ---- 一轮刚完成
         turn = s.get("turn") or {}
         tts = float(turn.get("ts") or 0)
@@ -1130,6 +1373,7 @@ class PetApp:
         elif kind == "right":
             self._popup_menu(mx, my)
         elif kind == "drag":
+            self._end_walk(save=False)
             self.panel.hide()
         elif kind == "drag_end":
             dock = self.cfg.get("dock") or {}
@@ -1186,10 +1430,13 @@ class PetApp:
         if not pet.get("look_tracking", True) or self._walk_dir or self._hidden_by_fs:
             return self._stop_look()
 
+        pos = _cursor_pos()
+        if not pos:
+            return self._stop_look()
+        px, py = pos
         x, y = self.win.position()
         cx = x + self.sprite.width * 0.5
         cy = y + self.sprite.height * 0.45
-        px, py = self.root.winfo_pointerxy()
         dx, dy = px - cx, py - cy
         dist = (dx * dx + dy * dy) ** 0.5
 
@@ -1200,27 +1447,38 @@ class PetApp:
         elif dist > near_r * self.LOOK_NEAR_EXIT:
             self._look_near = False
 
-        # 原实现只要"有采样"就整段关掉注视，而 WorkBuddy 几乎一直有采样，
-        # 于是这个功能形同不存在。现在：靠近一定看；远离时才让动画优先。
+        # 原实现只要"有采样"就关掉注视，而 WorkBuddy 几乎一直有采样，
+        # 这个功能形同不存在。现在只有**模型真的在生成**时才让动画优先，
+        # 且鼠标贴近时始终看过去。
         if not self._look_near:
-            s = self.sampler.get()
-            busy = s.get("status") == "working" or (s.get("active") and not s.get("stale"))
-            if busy:
+            if self.sampler.get().get("status") == "working":
                 return self._stop_look()
 
         if dist > float(pet.get("look_range") or 520):
             return self._stop_look()
 
         # 图集只有 16 个水平旋转帧，没有抬头/低头，见 look_atlas 的说明。
-        atlas = look_atlas(dx, dy, float(pet.get("look_offset", 270)))
+        target = look_atlas(dx, dy, float(pet.get("look_offset", 270)))
+        if self._look_t is None:
+            self._look_t = target
+        else:
+            # 最短弧插值：鼠标从左边移到右边时不绕一整圈
+            diff = ((target - self._look_t + 180.0) % 360.0) - 180.0
+            self._look_t = (self._look_t + diff * 0.38) % 360.0
+
         n = max(1, self.sprite.dir_count())
-        idx = int(round(atlas / (360.0 / n))) % n
+        frame = 360.0 / n
+        idx = int(round(self._look_t / frame)) % n
         self._looking = True
-        if idx == self._dir_idx:      # 去抖：方向没变就不重绘
+        if idx == self._dir_idx:      # 方向没变就不重绘
+            return
+        now = time.time()
+        if now - self._look_ts < 0.09:  # 帧间去抖：鼠标微动不换帧
             return
         self._dir_idx = idx
+        self._look_ts = now
         self.player.pause()
-        data, w, h = self.sprite.bgra_dir(atlas)
+        data, w, h = self.sprite.bgra_dir(self._look_t)
         if data:
             self.win.set_frame(data, w, h)
 
@@ -1228,7 +1486,11 @@ class PetApp:
         if self._looking:
             self._looking = False
             self._dir_idx = -1
+            self._look_t = None
+            self._look_ts = 0
             self.player.resume()
+        else:
+            self._look_t = None
 
     def _set_shown(self, show: bool):
         """统一控制桌宠与面板的可见性（贴靠模式频繁调用）。"""
@@ -1266,13 +1528,7 @@ class PetApp:
                 self.var_wander.set(False)
             except Exception:
                 pass
-            if self._wander_job:
-                try:
-                    self.root.after_cancel(self._wander_job)
-                except Exception:
-                    pass
-                self._wander_job = None
-            self._walk_dir = 0
+            self._end_walk(save=False)
         prefs.save(self.cfg)
         if dock["enabled"]:
             self._stop_look()
@@ -1325,10 +1581,19 @@ class PetApp:
             x, y = self.win.position()
             w, h = self.sprite.width, self.sprite.height
             px, py = self.root.winfo_pointerxy()
-            inside = (x <= px <= x + w) and (y <= py <= y + h)
+            inside_pet = (x <= px <= x + w) and (y <= py <= y + h)
+            # 面板本身也算悬停区：从桌宠挪到面板上的刷新按钮时不会中途收起
+            inside = inside_pet or self.panel.contains(px, py)
             if inside and not self._hover:
                 self._hover = True
-                self._show_panel()
+                if self._hover_job:
+                    try:
+                        self.root.after_cancel(self._hover_job)
+                    except Exception:
+                        pass
+                    self._hover_job = None
+                if inside_pet:
+                    self._show_panel()
             elif not inside and self._hover:
                 self._hover = False
                 self._maybe_hide_panel()
@@ -1525,35 +1790,15 @@ class PetApp:
     def _toggle_wander(self):
         on = bool(self.var_wander.get())
         self.cfg["pet"]["wander"] = on
-        if on:
-            # 漫步与"注视鼠标"互斥：走路时没法一直盯鼠标
-            self.cfg["pet"]["look_tracking"] = False
-            try:
-                self.var_look.set(False)
-            except Exception:
-                pass
-            self._stop_look()
+        if not on:
+            self._end_walk(save=False)
         prefs.save(self.cfg)
         self._schedule_wander()
 
     def _toggle_look(self):
         on = bool(self.var_look.get())
         self.cfg["pet"]["look_tracking"] = on
-        if on:
-            self.cfg["pet"]["wander"] = False
-            try:
-                self.var_wander.set(False)
-            except Exception:
-                pass
-            if self._wander_job:
-                try:
-                    self.root.after_cancel(self._wander_job)
-                except Exception:
-                    pass
-                self._wander_job = None
-            self._walk_dir = 0
-            self._schedule_wander()
-        else:
+        if not on:
             self._stop_look()
         prefs.save(self.cfg)
 
@@ -1582,7 +1827,7 @@ class PetApp:
         self._show_panel()
 
     # ---------------------------------------------------------------- 漫步
-    def _schedule_wander(self):
+    def _schedule_wander(self, delay: int | None = None):
         if self._wander_job:
             try:
                 self.root.after_cancel(self._wander_job)
@@ -1591,59 +1836,126 @@ class PetApp:
             self._wander_job = None
         if not self.cfg["pet"].get("wander"):
             return
-        # 间隔随机：9~26 秒，避免看起来像机械循环
-        self._wander_job = self.root.after(random.randint(9_000, 26_000),
-                                           self._wander_step)
+        if (self.cfg.get("dock") or {}).get("enabled"):
+            return
+        # 间隔随机：10~30 秒，避免看起来像机械循环
+        if delay is None:
+            delay = random.randint(10_000, 30_000)
+        self._wander_job = self.root.after(delay, self._wander_step)
+
+    def _end_walk(self, save: bool = True):
+        was_walking = bool(self._walk_dir)
+        self._walk_dir = 0
+        if was_walking:
+            self.player.play(petsprite.ANIM_IDLE)
+            if save:
+                self._save_pos()
+            self._schedule_wander()
 
     def _wander_step(self):
         self._wander_job = None
-        if not self.cfg["pet"].get("wander"):
+        pet = self.cfg["pet"]
+        if not pet.get("wander"):
             return
         if (self.cfg.get("dock") or {}).get("enabled"):
-            self._wander_job = self.root.after(random.randint(8_000, 15_000),
-                                               self._wander_step)
+            self._schedule_wander(random.randint(8_000, 15_000))
             return
+        # 面板正开着（钉住/临时展示）或桌宠不可见时不走开
+        if self.panel.visible() or self._hidden_by_fs or not self._shown:
+            self._schedule_wander(5_000 + random.randint(0, 4_000))
+            return
+
         s = self.sampler.get()
-        if s.get("status") == "working" or s.get("active"):
-            self._wander_job = self.root.after(random.randint(5_000, 9_000),
-                                               self._wander_step)
+        if s.get("status") == "working":
+            self._wander_defer_start = 0.0
+            self._schedule_wander(random.randint(5_000, 9_000))
             return
+        # "活跃但空闲"最多让路 30 秒；否则开着会话就永远不漫步了
+        if s.get("active"):
+            now = time.time()
+            if not self._wander_defer_start:
+                self._wander_defer_start = now
+            if now - self._wander_defer_start < 30.0:
+                self._schedule_wander(random.randint(4_000, 8_000))
+                return
+        self._wander_defer_start = 0.0
 
         w, h = self.sprite.width, self.sprite.height
         x, y = self.win.position()
-        sw = self.root.winfo_screenwidth()
-        lo, hi = 24, max(25, sw - w - 24)
+        # 在当前显示器的工作区内走，任务栏/副屏边缘都不会踩空
+        area = _work_area_at(int(x + w / 2), int(y + h / 2))
+        if not area:
+            self._schedule_wander()
+            return
+        margin = 24
+        lo = area[0] + margin
+        hi = area[2] - w - margin
+        if hi <= lo:
+            self._schedule_wander()
+            return
 
-        # 随机目标点，且至少偏离一个身位（否则原地抖动）
-        target = x
-        min_move = max(140, w)
-        for _ in range(10):
-            t = random.randint(lo, hi)
+        mouse = _cursor_pos()
+        target = None
+        for _ in range(12):
+            dist = random.randint(90, 380)
+            direction = random.choice((-1, 1))
+            t = x + direction * dist
+            if t < lo or t > hi:
+                t = x - direction * dist
+            t = max(lo, min(hi, t))
+            if abs(t - x) < 60:
+                continue
+            if mouse:
+                # 别把目标点选在鼠标脚下（水平走，只看横向是否挡路）
+                if (abs((t + w / 2) - mouse[0]) < 110
+                        and abs((y + h / 2) - mouse[1]) < h):
+                    continue
             target = t
-            if abs(t - x) >= min_move:
-                break
+            break
+        if target is None:
+            self._schedule_wander(random.randint(6_000, 12_000))
+            return
 
-        direction = 1 if target > x else -1
-        speed = random.randint(6, 12)          # 随机步速
+        move = target - x
+        direction = 1 if move > 0 else -1
+        speed = random.uniform(55.0, 125.0)         # px/s，长距离走快点
+        dur = max(1.2, min(6.0, abs(move) / speed))
         anim = petsprite.ANIM_WALK_R if direction > 0 else petsprite.ANIM_WALK_L
         self._walk_dir = direction
         self._stop_look()
         self.panel.hide()
         self.player.play(anim)
 
+        x0 = float(x)
+        target_x = float(target)
+        t0 = time.time()
+        stalled = 0.0
+
         def step_move():
             if not self._walk_dir:
                 return
+            now = time.time()
+            p = min(1.0, (now - t0) / dur)
+            eased = 0.5 - 0.5 * math.cos(math.pi * p)   # 起步/收尾都减速
+            nx = int(round(x0 + (target_x - x0) * eased))
             cx, cy = self.win.position()
-            nx = cx + direction * speed
-            if (direction > 0 and nx >= target) or (direction < 0 and nx <= target):
-                self._walk_dir = 0
-                self.player.play(petsprite.ANIM_IDLE)
-                self._save_pos()
-                self._schedule_wander()
-                return
+            cur = _cursor_pos()
+            if cur:
+                d = ((cur[0] - (nx + w / 2)) ** 2
+                     + (cur[1] - (cy + h / 2)) ** 2) ** 0.5
+                if d < 80:
+                    # 鼠标挡在面前：原地等一会儿，不从指针底下穿过去
+                    stalled += 0.12
+                    if stalled > 2.0:
+                        self._end_walk()
+                        return
+                    self.root.after(120, step_move)
+                    return
             self.win.move_to(nx, cy)
-            self.root.after(80, step_move)
+            if p >= 1.0:
+                self._end_walk()
+                return
+            self.root.after(30, step_move)
 
         step_move()
 
@@ -1653,6 +1965,7 @@ class PetApp:
             fs = win32ui.is_fullscreen_foreground()
             if fs and not self._hidden_by_fs:
                 self._hidden_by_fs = True
+                self._end_walk(save=False)
                 self._set_shown(False)
             elif not fs and self._hidden_by_fs:
                 self._hidden_by_fs = False
@@ -1714,8 +2027,60 @@ class PetApp:
         self.panel.pinned = False
         self.panel.hide()
 
+    def refresh_balances_now(self):
+        """面板里的刷新按钮：后台查询，完成后在主线程重画；不改钉住状态。"""
+        if self._bal_refreshing:
+            return
+        items = providers.enabled_items(self.cfg)
+        if not items:
+            self._alert("balance_none",
+                        "尚未启用余额服务商（设置页可配置或从 cc-switch 导入）")
+            return
+
+        self._bal_refreshing = True
+        self._bal_refresh_result = None
+        self._bal_refresh_deadline = time.time() + 20
+        self.panel.set_balance_refreshing(True)
+
+        def work():
+            res = []
+            try:
+                res = providers.query_all(items, timeout=9)
+            except Exception:
+                res = []
+            self._bal_refresh_result = res
+
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(120, self._poll_balance_refresh)
+
+    def _poll_balance_refresh(self):
+        # 工作线程只赋值列表，Tk 调用全部留在主线程
+        if (self._bal_refresh_result is None
+                and time.time() < self._bal_refresh_deadline):
+            self.root.after(120, self._poll_balance_refresh)
+            return
+        res = self._bal_refresh_result or []
+        self._bal_refresh_result = None
+        self._bal_refreshing = False
+        self.panel.set_balance_refreshing(False)
+        if res:
+            self._balances = res
+            self._balance_ts = int(time.time() * 1000)
+            bad = [b for b in res if not b.get("ok")]
+            if bad and len(bad) == len(res):
+                self._pending_bubbles.append(
+                    ([(None, "余额查询失败", FG_WARN),
+                      (None, f"{bad[0].get('label', '')}：{bad[0].get('error', '')}",
+                       FG_SUB)], "余额", 6000)
+                )
+        else:
+            self._pending_bubbles.append(
+                ([(None, "余额查询失败", FG_WARN)], "余额", 6000))
+        if self.panel.visible():
+            self._show_panel()
+
     def show_balance(self):
-        """刷新全部已启用服务商的余额，并把结果直接显示在面板同一块里。"""
+        """菜单「查看余额」：临时钉住面板，再走同一套刷新流程。"""
         items = providers.enabled_items(self.cfg)
         if not items:
             self._alert("balance_none",
@@ -1724,22 +2089,7 @@ class PetApp:
             return
 
         self._flash_panel(10)
-
-        def work():
-            try:
-                self._balances = providers.query_all(items, timeout=9)
-                self._balance_ts = int(time.time() * 1000)
-                bad = [b for b in self._balances if not b.get("ok")]
-                if bad and len(bad) == len(self._balances):
-                    self._pending_bubbles.append(
-                        ([(None, "余额查询失败", FG_WARN),
-                          (None, f"{bad[0].get('label', '')}：{bad[0].get('error', '')}",
-                           FG_SUB)], "余额", 6000)
-                    )
-            except Exception:
-                pass
-
-        threading.Thread(target=work, daemon=True).start()
+        self.refresh_balances_now()
 
     # ---------------------------------------------------------------- 其它动作
     def export_csv(self):
@@ -1813,18 +2163,14 @@ class PetApp:
             self.set_scale(float(np["scale"]), save=False)
         if bool(np.get("wander")) != bool(op.get("wander")):
             self.var_wander.set(bool(np.get("wander")))
-            self._schedule_wander()
-            if not np.get("wander"):
-                self._walk_dir = 0
+            if np.get("wander"):
+                self._schedule_wander()
+            else:
+                self._end_walk(save=False)
         if not np.get("look_tracking", True):
             self._stop_look()
-        wt_, lt_ = bool(np.get("wander")), bool(np.get("look_tracking", True))
-        if wt_ and lt_:                     # 配置里同时开时，优先保留漫步
-            np["look_tracking"] = False
-            lt_ = False
-            self.cfg["pet"]["look_tracking"] = False
-            prefs.save(self.cfg)
-        self.var_look.set(lt_)
+        # 漫步与注视不再互斥：走路时注视自动让位，停下后恢复
+        self.var_look.set(bool(np.get("look_tracking", True)))
         self.var_sound.set(bool((new.get("alerts") or {}).get("sound", True)))
         self.var_fs.set(bool((new.get("system") or {}).get("hide_on_fullscreen", True)))
         self.var_dock.set(bool((new.get("dock") or {}).get("enabled")))
@@ -1837,6 +2183,7 @@ class PetApp:
         elif self.cfg["pet"].get("wander"):
             self.cfg["pet"]["wander"] = False
             self.var_wander.set(False)
+            self._end_walk(save=False)
             prefs.save(self.cfg)
         self.basis = new.get("basis", "eff")
         self.basis_var.set(self.basis)
@@ -1918,6 +2265,10 @@ _U.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
 _U.GetWindowThreadProcessId.restype = wt.DWORD
 _U.GetSystemMetrics.argtypes = [ctypes.c_int]
 _U.GetSystemMetrics.restype = ctypes.c_int
+_U.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+_U.GetCursorPos.restype = wt.BOOL
+_U.MonitorFromPoint.argtypes = [wt.POINT, wt.DWORD]
+_U.MonitorFromPoint.restype = wt.HMONITOR
 
 # OpenProcess 必须声明 restype：默认按 c_int 返回，64 位下句柄会被截断，
 # 随后 CloseHandle 拿到的是错值 —— 每轮窗口枚举都漏一个进程句柄。
@@ -1935,6 +2286,41 @@ SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
+
+
+def _cursor_pos():
+    """当前鼠标位置（虚拟屏坐标）；GetCursorPos 比 Tk 的 pointerxy 更少延迟。"""
+    try:
+        p = wt.POINT()
+        if _U.GetCursorPos(ctypes.byref(p)):
+            return int(p.x), int(p.y)
+    except Exception:
+        pass
+    return None
+
+
+def _work_area_at(x: int, y: int):
+    """坐标所在显示器的可用区域（已扣除任务栏）；失败时退回整个虚拟屏。"""
+    try:
+        hmon = _U.MonitorFromPoint(wt.POINT(int(x), int(y)), 2)
+        if hmon:
+            mi = _MONITORINFO()
+            mi.cbSize = ctypes.sizeof(_MONITORINFO)
+            if _U.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                r = mi.rcWork
+                return r.left, r.top, r.right, r.bottom
+    except Exception:
+        pass
+    try:
+        vx = _U.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        vy = _U.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        vw = _U.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        vh = _U.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        if vw > 0 and vh > 0:
+            return vx, vy, vx + vw, vy + vh
+    except Exception:
+        pass
+    return None
 
 
 def _clamp_to_virtual_screen(x: int, y: int, w: int, h: int):

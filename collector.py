@@ -61,7 +61,7 @@ _CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _CACHE_FILE = _CACHE_DIR / "usage-cache.json"
 
-_CACHE_VERSION = 6        # v6: 记录增加 src / orig_credit / ctx / rid（多应用数据源）
+_CACHE_VERSION = 7        # v7: 记录增加 ttft / exact_ms / data_src（一手 + 回退）
 _lock = Lock()
 
 SCOPES = ("today", "7d", "30d", "all")
@@ -70,6 +70,72 @@ SCOPES = ("today", "7d", "30d", "all")
 MATCH_TOLERANCE_MS = 8000
 # 实时速率窗口（毫秒）
 LIVE_WINDOW_MS = 120_000
+
+# 自动来源：最近活动窗口 / 切源最短保持 / 前台加权
+_AUTO_WINDOW_MS = 120_000
+_AUTO_HOLD_MS = 20_000
+_AUTO_FG_BOOST_MS = 30_000
+_AUTO_STATE: Dict[str, Any] = {"src": "", "switch_ts": 0.0}
+
+
+def _foreground_src() -> str:
+    """
+    前台进程 → 数据源。只做加权，不做唯一判据：
+    Claude Code / Codex 常跑在终端里，进程名是 WindowsTerminal，无法区分。
+    """
+    try:
+        import win32ui
+        name = win32ui.foreground_process_name().lower()
+    except Exception:
+        return ""
+    for key, src in (("qoder", "qoder"), ("workbuddy", "workbuddy"),
+                     ("claude", "claude"), ("codex", "codex")):
+        if key in name:
+            return src
+    return ""
+
+
+def resolve_auto_source(records: List[Dict[str, Any]]) -> str:
+    """
+    自动来源 = 最近 120 秒内有活动的源里最新者。
+
+    同一轮里不切来切去：当前源仍有活动且挑战者没明显领先时保持；
+    但用户切到的前台应用不受防抖约束，新请求一到就立刻跟随；
+    所有源都空闲时回落到 all（聚合视图）。
+    """
+    now = time.time() * 1000.0
+    last: Dict[str, float] = {}
+    for r in records:
+        src = r.get("src") or ""
+        ts = float(r.get("ts") or 0)
+        if src and ts > last.get(src, 0):
+            last[src] = ts
+
+    cand = {s: t for s, t in last.items() if now - t <= _AUTO_WINDOW_MS}
+    if not cand:
+        _AUTO_STATE["src"] = ""
+        return "all"
+
+    fg = _foreground_src()
+
+    def score(item: Tuple[str, float]) -> float:
+        src, ts = item
+        return ts + (_AUTO_FG_BOOST_MS if src == fg else 0.0)
+
+    chosen = max(cand.items(), key=score)[0]
+    prev = str(_AUTO_STATE.get("src") or "")
+    # 防抖只拦"后台应用刚好冒了个请求"的情况。用户已经主动切到某个应用时
+    # 必须立刻跟过去，否则切完还要等十几秒才有反应，正是之前的体感来源。
+    if prev and prev in cand and chosen != prev and chosen != fg:
+        if (now - float(_AUTO_STATE.get("switch_ts") or 0) < _AUTO_HOLD_MS
+                and last[prev] >= now - 30_000):
+            chosen = prev
+        elif last[prev] >= now - 60_000 and last[chosen] <= last[prev] + 10_000:
+            chosen = prev
+    if chosen != prev:
+        _AUTO_STATE["switch_ts"] = now
+    _AUTO_STATE["src"] = chosen
+    return chosen
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -554,6 +620,12 @@ def _attach_model_ms(records: List[Dict[str, Any]],
             r["gap_ms"] = dt
             r["tool_ms"] = tool
 
+    # 一手 rollout / cc-switch 自带真实耗时，优先于按间隔推算（首条记录没有 prev）
+    for r in records:
+        exact = float(r.get("exact_ms") or 0)
+        if exact > 0:
+            r["model_ms"] = max(50.0, exact)
+
 
 # ---------------------------------------------------------------- 数据库读取
 
@@ -676,6 +748,12 @@ def live_stats(recs: List[Dict[str, Any]]) -> Dict[str, Any]:
             n_raw += 1
 
     gaps.sort()
+    ts = sorted(float(r.get("ts") or 0) for r in recs if r.get("ts"))
+    span_min = ((ts[-1] - ts[0]) / 60_000.0) if len(ts) > 1 else 0.0
+    # 单请求时至少按 1 分钟算，否则 credits/min 会被放大成 60 倍
+    rate_min = max(span_min, 1.0) if recs else 0.0
+    credits = sum(float(r.get("credit") or 0) for r in recs)
+    credit_reqs = sum(1 for r in recs if float(r.get("credit") or 0) > 0)
     return {
         # 主口径：扣除工具执行/等待后的有效速率
         "out_tps": (eff_out / eff_secs) if eff_secs else 0.0,
@@ -691,6 +769,12 @@ def live_stats(recs: List[Dict[str, Any]]) -> Dict[str, Any]:
         # 工具执行时间占请求间隔的比例，用于说明"排除了多少"
         "tool_ratio": (tool_ms / (raw_secs * 1000.0)) if raw_secs else 0.0,
         "model_secs": eff_secs,
+        # 无 token 的源用这两项：credits/分钟、请求/分钟（墙钟口径）
+        "credits": credits,
+        "credit_per_min": (credits / rate_min) if rate_min else 0.0,
+        "credit_per_req": (credits / credit_reqs) if credit_reqs else 0.0,
+        "req_per_min": (len(recs) / rate_min) if rate_min else 0.0,
+        "requests": len(recs),
     }
 
 
@@ -751,6 +835,19 @@ def ttft_stats(recs: List[Dict[str, Any]],
     无 trace 时退化为"请求间隔 − 工具执行时间"（含排队，属上界）。
     解码速度取基线表。结果一律标注为"估算"，不与实测口径混用。
     """
+    # 一手 TTFT 优先（Codex task_complete / cc-switch first_token_ms），
+    # 有实测就不再混入估算值，避免两者口径互相污染。
+    real = [float(r["ttft"]) for r in recs if float(r.get("ttft") or 0) > 0]
+    if real:
+        real.sort()
+        return {
+            "ttft_ms": sum(real) / len(real),
+            "p50_ms": _pct(real, 0.5),
+            "p95_ms": _pct(real, 0.95),
+            "samples": len(real),
+            "estimated": False,
+        }
+
     vals: List[float] = []
     for r in recs:
         ms = r.get("dur") or 0
@@ -769,7 +866,8 @@ def ttft_stats(recs: List[Dict[str, Any]],
             est = ms
         vals.append(est)
     if not vals:
-        return {"ttft_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "samples": 0}
+        return {"ttft_ms": 0.0, "p50_ms": 0.0, "p95_ms": 0.0, "samples": 0,
+                "estimated": True}
     vals.sort()
     return {
         "ttft_ms": sum(vals) / len(vals),
@@ -784,6 +882,8 @@ def ttft_stats(recs: List[Dict[str, Any]],
 
 def turn_compare(recs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """最近两次请求的速率对比（用于胶囊上的涨跌箭头）。"""
+    # Qoder 的 out 恒为 0，但仍要保留 turn.ts，桌宠才能在一轮完成时播 OK 动画；
+    # 速率涨跌只在双方都有输出时才算（delta=None），不会被读成 0 t/s 的假跌。
     tail = [r for r in recs if (r.get("model_ms") or 0) > 0]
     if len(tail) < 2:
         return None
@@ -811,13 +911,22 @@ def turn_compare(recs: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------- CSV 导出
 
 CSV_HEADER = [
-    "source", "session_id", "session_title", "model", "request_ts", "request_time",
+    "source", "session_id", "session_title", "model", "unit", "data_source",
+    "request_ts", "request_time",
     "input_tokens", "output_tokens", "total_tokens", "cached_tokens",
     "cache_hit_rate", "reasoning_tokens", "credit", "original_credit",
     "context_ratio", "gap_ms", "tool_ms",
-    "model_ms", "gen_ms_trace", "out_tps_effective", "in_tps_effective",
+    "model_ms", "gen_ms_trace", "ttft_ms", "out_tps_effective", "in_tps_effective",
     "is_subagent",
 ]
+
+
+def _record_unit(r: Dict[str, Any]) -> str:
+    if (r.get("in") or 0) + (r.get("out") or 0) > 0:
+        return "tokens"
+    if float(r.get("credit") or 0) > 0:
+        return "credit"
+    return "requests"
 
 
 def export_csv(scope: str = "all", path: Optional[str] = None,
@@ -825,7 +934,11 @@ def export_csv(scope: str = "all", path: Optional[str] = None,
     """把逐请求明细导出为 CSV，返回文件路径。"""
     import csv
 
+    if source not in sources.SOURCE_IDS + ("all", "auto"):
+        source = "all"
     records, _ = collect_requests()
+    if source == "auto":
+        source = resolve_auto_source(records)
     if source != "all" and source in sources.SOURCE_IDS:
         records = [r for r in records if r.get("src") == source]
     db = read_db()
@@ -851,6 +964,8 @@ def export_csv(scope: str = "all", path: Optional[str] = None,
                 r["sid"],
                 titles.get(r["sid"], ""),
                 r["model"],
+                _record_unit(r),
+                r.get("data_src") or "local",
                 int(r["ts"]),
                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(r["ts"] / 1000.0)) if r["ts"] else "",
                 r["in"], r["out"], r["in"] + r["out"], r["cached"],
@@ -860,6 +975,7 @@ def export_csv(scope: str = "all", path: Optional[str] = None,
                 f"{float(r.get('ctx') or 0):.6f}",
                 int(gm), int(r.get("tool_ms") or 0), int(mm),
                 int(r.get("dur") or 0),
+                int(r.get("ttft") or 0),
                 f"{(r['out'] / (mm / 1000.0)):.2f}" if mm else "",
                 f"{(r['in'] / (mm / 1000.0)):.2f}" if mm else "",
                 1 if r["sub"] else 0,
@@ -875,18 +991,21 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
     生成聚合结果。
 
     scope  : today | 7d | 30d | all
-    source : all | workbuddy | qoder | codex | claude
+    source : all | auto | workbuddy | qoder | codex | claude
 
-    源筛选作用在**记录层**，因此 totals / rates / by_model / by_day / by_hour /
-    minute_series / sessions 全部派生统计都自动跟着走 —— 不会出现"总数筛了、
-    图表还是全量"的割裂。`by_source` 则始终基于全量，供筛选器显示各源计数。
+    auto 会先解析成"最近 120 秒内有活动的最新源"，再按该源筛选；
+    因此 totals / rates / by_model / by_day / by_hour / minute_series /
+    sessions 全部派生统计都自动跟着走。`by_source` 始终基于全量。
     """
     if scope not in SCOPES:
         scope = "all"
-    if source != "all" and source not in sources.SOURCE_IDS:
-        source = "all"
+    requested_source = source if (source == "auto" or source == "all"
+                                 or source in sources.SOURCE_IDS) else "all"
 
     all_records, _tools = collect_requests()
+    # 仪表盘始终显示一个"自动"页签，即使当前手动选了别的源，也要知道自动会落到哪
+    auto_source = resolve_auto_source(all_records)
+    source = auto_source if requested_source == "auto" else requested_source
     records = (all_records if source == "all"
                else [r for r in all_records if r.get("src") == source])
     db = read_db()
@@ -937,13 +1056,17 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
             continue
         a = bmodel.setdefault(
             r["model"], {"model": r["model"], "out": 0, "inp": 0, "secs": 0.0,
-                         "durs": [], "n": 0}
+                         "durs": [], "n": 0, "srcs": {}, "sub": 0}
         )
         a["out"] += r["out"]
         a["inp"] += r["in"]
         a["secs"] += r["dur"] / 1000.0
         a["durs"].append(r["dur"])
         a["n"] += 1
+        src = r.get("src") or ""
+        if src:
+            a["srcs"][src] = a["srcs"].get(src, 0) + 1
+        a["sub"] += 1 if r.get("sub") else 0
     baseline["by_model"] = [
         {
             "model": a["model"],
@@ -952,6 +1075,11 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
             "avg_ms": (sum(a["durs"]) / a["n"]) if a["n"] else 0.0,
             "p95_ms": _pct(sorted(a["durs"]), 0.95),
             "samples": a["n"],
+            # 同一个模型可能被多个 agent（WorkBuddy/Qoder/Codex/Claude）调用，
+            # 按调用次数给出，UI 在模型名后标注来源。
+            "srcs": [{"id": k, "n": v} for k, v in
+                     sorted(a["srcs"].items(), key=lambda kv: (-kv[1], kv[0]))],
+            "sub_samples": a["sub"],
         }
         for a in bmodel.values()
     ]
@@ -960,7 +1088,9 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
     recent_recs = [r for r in records if r["ts"] >= now - LIVE_WINDOW_MS]
     recent = live_stats(recent_recs)
     recent["window_ms"] = LIVE_WINDOW_MS
-    recent["stale"] = recent["samples"] < 1
+    # 没有 token 的源（Qoder）samples 恒为 0，但请求是真实发生的；
+    # 用请求数判断"近期是否有活动"，否则它会被永远当成 stale。
+    recent["stale"] = recent["requests"] < 1
     if recent["stale"]:
         # 无近期请求时回落到最近 30 条，标注 recent.fallback
         # nlargest 只需 O(n log 30)，避免对全部记录做全排序
@@ -973,6 +1103,10 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
                 "e2e_tps": fb["e2e_tps"],
                 "samples": fb["samples"],
                 "median_gap_ms": fb["median_gap_ms"],
+                "credit_per_min": fb["credit_per_min"],
+                "credit_per_req": fb["credit_per_req"],
+                "req_per_min": fb["req_per_min"],
+                "requests": fb["requests"],
                 "fallback": True,
             }
         )
@@ -1005,7 +1139,7 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
         a = by_model_map.setdefault(
             r["model"],
             {"model": r["model"], "requests": 0, "input": 0, "output": 0,
-             "cached": 0, "credit": 0.0, "recs": []},
+             "cached": 0, "credit": 0.0, "recs": [], "srcs": {}, "sub": 0},
         )
         a["requests"] += 1
         a["input"] += r["in"]
@@ -1013,10 +1147,17 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
         a["cached"] += r["cached"]
         a["credit"] += r["credit"]
         a["recs"].append(r)
+        src = r.get("src") or ""
+        if src:
+            a["srcs"][src] = a["srcs"].get(src, 0) + 1
+        a["sub"] += 1 if r.get("sub") else 0
 
     models = []
     for m in by_model_map.values():
         recs_m = m.pop("recs")
+        m["srcs"] = [{"id": k, "n": v} for k, v in
+                     sorted(m.pop("srcs").items(), key=lambda kv: (-kv[1], kv[0]))]
+        m["sub_samples"] = m.pop("sub")
         dec = decode_stats(recs_m)
         lv = live_stats(recs_m)
         m["cache_rate"] = (m["cached"] / m["input"]) if m["input"] else 0.0
@@ -1048,10 +1189,11 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
 
         hk = _local_hour(r["ts"])
         h = by_hour.setdefault(hk, {"hour": hk, "input": 0, "output": 0,
-                                    "requests": 0, "models": {}})
+                                    "requests": 0, "credit": 0.0, "models": {}})
         h["input"] += r["in"]
         h["output"] += r["out"]
         h["requests"] += 1
+        h["credit"] += r["credit"]
         hm = h["models"].setdefault(r["model"], {"input": 0, "output": 0})
         hm["input"] += r["in"]
         hm["output"] += r["out"]
@@ -1129,44 +1271,81 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
         sessions.sort(key=lambda s: -(s["updated_at"] or 0))
 
     # ---- 实时会话
+    # all 模式不能再无条件取 WorkBuddy：那会让 Qoder/Codex 正在跑时，
+    # 面板仍停在 WorkBuddy 的旧会话，看起来像"没反应"。
     live: Optional[Dict[str, Any]] = None
-    if usage_meta and wb_only:
-        sid_live = max(usage_meta, key=lambda k: usage_meta[k]["updated_at"])
+    wb_sid, wb_ts = "", -1.0
+    if source in ("all", "workbuddy") and usage_meta:
+        sid_u = max(usage_meta, key=lambda k: usage_meta[k]["updated_at"])
+        ts_u = float(usage_meta[sid_u].get("updated_at") or 0)
+        meta_u = sessions_meta.get(sid_u) or {}
+        # 上下文占用可能在请求结束后还更新一会儿；超过 15 分钟又没有 working
+        # 状态就不再拿它当"实时"，改看记录里的最新会话。
+        if (source == "workbuddy" or now - ts_u <= 15 * 60_000
+                or meta_u.get("status") == "working"):
+            wb_sid, wb_ts = sid_u, ts_u
+
+    sess_sid, sess_ts = "", -1.0
+    if sess_agg:
+        sess_sid = max(sess_agg, key=lambda k: sess_agg[k].get("last_ts") or 0)
+        sess_ts = float(sess_agg[sess_sid].get("last_ts") or 0)
+
+    if wb_sid and wb_ts >= sess_ts:
+        sid_live = wb_sid
         u = usage_meta[sid_live]
         meta = sessions_meta.get(sid_live) or {}
         a = sess_agg.get(sid_live) or {}
         size = u["size"] or meta.get("context_window") or 0
+        # all 模式下 recent 混着别的源，WorkBuddy 的实时速率要单独算
+        recs_s = a.get("recs") or []
+        recs_rate = ([r for r in recent_recs if r.get("src") == "workbuddy"]
+                     or recs_s)
+        lv_recent = live_stats(recs_rate)
         live = {
             "session_id": sid_live,
             "title": meta.get("title"),
+            "src": "workbuddy",
             "model": a.get("model") or meta.get("model") or "",
             "used": u["used"],
             "size": size,
             "pct": (u["used"] / size) if size else 0.0,
+            "pct_source": "used",
             "session_input": a.get("input", 0),
             "session_output": a.get("output", 0),
             "session_credit": a.get("credit", 0.0),
             "requests": a.get("requests", 0),
-            "out_tps": recent["out_tps"],
-            "in_tps": recent["in_tps"],
-            "median_gap_ms": recent.get("median_gap_ms", 0),
-            "stale": recent.get("stale", False),
+            "out_tps": lv_recent["out_tps"],
+            "in_tps": lv_recent["in_tps"],
+            "credit_per_min": lv_recent.get("credit_per_min", 0.0),
+            "credit_per_req": lv_recent.get("credit_per_req", 0.0),
+            "req_per_min": lv_recent.get("req_per_min", 0.0),
+            "recent_requests": lv_recent.get("requests", 0),
+            "recent_samples": lv_recent.get("samples", 0),
+            "unit": ("tokens"
+                     if (a.get("input") or 0) + (a.get("output") or 0) > 0
+                     else "credits" if (a.get("credit") or 0) > 0
+                     else "requests"),
+            "median_gap_ms": lv_recent.get("median_gap_ms", 0),
+            "stale": lv_recent.get("requests", 0) < 1,
             "fallback": recent.get("fallback", False),
             "updated_at": u["updated_at"],
             "status": meta.get("status"),
         }
-    elif sess_agg:
+    elif sess_sid:
         # 非 WorkBuddy 源没有 session_usage 表，实时上下文占用改用记录里的
         # context_usage_ratio（Qoder 直接给 0~1 的比例）。used/size 拿不到就留 0，
         # UI 靠 pct_source 知道该只显示百分比、不要显示"x / y tokens"。
-        sid_live = max(sess_agg, key=lambda k: sess_agg[k].get("last_ts") or 0)
-        a = sess_agg[sid_live]
+        a = sess_agg[sess_sid]
         recs_s = a.get("recs") or []
         ctx = max((r.get("ctx") or 0.0) for r in recs_s) if recs_s else 0.0
+        live_src = (recs_s[0].get("src") if recs_s else "") or ""
+        # 速率只取当前会话/当前源，别把 all 下其它应用的流量算进这一条读数
+        recs_rate = [r for r in recent_recs if r.get("src") == live_src] or recs_s
+        lv = live_stats(recs_rate)
         live = {
-            "session_id": sid_live,
+            "session_id": sess_sid,
             "title": None,
-            "src": (recs_s[0].get("src") if recs_s else "") or "",
+            "src": live_src,
             "model": a.get("model") or "",
             "used": 0,
             "size": 0,
@@ -1176,11 +1355,20 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
             "session_output": a.get("output", 0),
             "session_credit": a.get("credit", 0.0),
             "requests": a.get("requests", 0),
-            "out_tps": recent["out_tps"],
-            "in_tps": recent["in_tps"],
-            "median_gap_ms": recent.get("median_gap_ms", 0),
-            "stale": recent.get("stale", False),
-            "fallback": recent.get("fallback", False),
+            "out_tps": lv["out_tps"],
+            "in_tps": lv["in_tps"],
+            "credit_per_min": lv.get("credit_per_min", 0.0),
+            "credit_per_req": lv.get("credit_per_req", 0.0),
+            "req_per_min": lv.get("req_per_min", 0.0),
+            "recent_requests": lv.get("requests", 0),
+            "recent_samples": lv.get("samples", 0),
+            "unit": ("tokens"
+                     if (a.get("input") or 0) + (a.get("output") or 0) > 0
+                     else "credits" if (a.get("credit") or 0) > 0
+                     else "requests"),
+            "median_gap_ms": lv.get("median_gap_ms", 0),
+            "stale": lv.get("requests", 0) < 1,
+            "fallback": False,
             "updated_at": a.get("last_ts") or 0,
             "status": "",
         }
@@ -1188,6 +1376,15 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
     # ---- 首字延迟估算 / 本轮对比 / 正在运行的会话
     rate_map = {b["model"]: b["out_tps"] for b in baseline["by_model"]}
     ttft = ttft_stats(filtered, rate_map)
+    if live is not None:
+        # 首字延迟跟着实时会话走：全部来源下 Qoder 在跑时不能拿 Codex 的 TTFT
+        # 冒充，反过来也一样。
+        live_src = live.get("src") or ""
+        recs_t = (filtered if live_src in ("", "all")
+                  else [r for r in filtered if r.get("src") == live_src])
+        lt = ttft_stats(recs_t, rate_map)
+        live["ttft"] = lt["ttft_ms"]
+        live["ttft_est"] = lt["estimated"]
     turn = turn_compare(recent_recs if recent_recs else records)
 
     running: List[Dict[str, Any]] = []
@@ -1277,6 +1474,17 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
             "traced": len({r["sid"] for r in records if r["dur"] > 0}),
         },
         "source": source,
+        "requested_source": requested_source,
+        "auto_source": auto_source,
+        # 当前筛选结果里哪些单位真正有数据：UI 据此决定显示 t/s、cr/min 还是 req/min
+        "units": {
+            "tokens": bool(totals["input"] or totals["output"]),
+            "credits": totals["credit"] > 0,
+            "requests": totals["requests"] > 0,
+            "primary": ("tokens" if (totals["input"] or totals["output"])
+                        else "credits" if totals["credit"] > 0
+                        else "requests" if totals["requests"] else ""),
+        },
         # 始终基于全量记录，供筛选器显示各源计数与"为什么没数据"
         "by_source": sources.probe(all_records),
     }

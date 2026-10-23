@@ -212,6 +212,10 @@
   .tabs-ghost .tab{padding:0 10px;color:var(--faint);font-size:var(--fs-cap);border-radius:var(--r-pill)}
   .tabs-ghost .tab:hover{background:rgba(118,118,128,.09);color:var(--text2)}
   .tabs-ghost .tab.on{background:var(--accent-soft);color:var(--accent);box-shadow:none;font-weight:600}
+  /* 窄屏时让时间区间整组保住，只让数据源那排横向滚动，
+     否则多一个「自动」后「全部/30 天」会被挤出可视区。 */
+  #tabs{flex:0 0 auto}
+  #srcTabs{min-width:0}
 
   .wrap{max-width:var(--page-max);margin:0 auto;padding:var(--s-7) var(--gutter) var(--s-9)}
 
@@ -780,6 +784,8 @@
   .mtag.solid{background:var(--c,#1D1D1F);color:#fff}
   .mtag.amber{color:#9A3412;background:#FFF2E6;border-color:#F8DFC7}
   .mtag.blue{color:#0A5CB8;background:#E9F2FD;border-color:#CFE3FA}
+  /* 模型名后的 agent 来源：中性色，避免和「最快」的琥珀色抢注意力 */
+  .mtag.agent{color:var(--muted);background:var(--well);border-color:rgba(0,0,0,.055);font-weight:500}
 
   .runrow{
     display:flex;align-items:center;gap:var(--s-3);padding:13px 0;
@@ -1005,6 +1011,7 @@
     </div>
     <span class="toolbar-div" aria-hidden="true"></span>
     <div class="tabs tabs-ghost" id="srcTabs" title="按应用筛选（各应用能给的指标不同）">
+      <button class="tab" data-source="auto">自动</button>
       <button class="tab on" data-source="all">全部</button>
       <button class="tab" data-source="workbuddy">WorkBuddy</button>
       <button class="tab" data-source="qoder">Qoder</button>
@@ -1031,12 +1038,12 @@
     <div class="hero-body">
       <div class="rates">
         <div class="rate h-out">
-          <span class="lab"><i style="background:#F6B26B"></i>下行 · 输出</span>
-          <span class="val"><b class="num mono" id="h-out">—</b><span class="unit">t/s</span></span>
+          <span class="lab" id="h-out-lab"><i style="background:#F6B26B"></i>下行 · 输出</span>
+          <span class="val"><b class="num mono" id="h-out">—</b><span class="unit" id="h-out-unit">t/s</span></span>
         </div>
         <div class="rate h-in">
-          <span class="lab"><i style="background:#8FB6F5"></i>上行 · 输入</span>
-          <span class="val"><b class="num mono" id="h-in">—</b><span class="unit">t/s</span></span>
+          <span class="lab" id="h-in-lab"><i style="background:#8FB6F5"></i>上行 · 输入</span>
+          <span class="val"><b class="num mono" id="h-in">—</b><span class="unit" id="h-in-unit">t/s</span></span>
         </div>
       </div>
       <div class="hspark">
@@ -1048,7 +1055,7 @@
     <div class="hero-strip">
       <div class="hstat"><span>请求间隔中位</span><b class="num mono" id="h-gap">—</b></div>
       <div class="hstat"><span title="估算值：模型时间 − 输出 tokens ÷ 解码速度">首字延迟</span><b class="num mono" id="h-ttft">—</b></div>
-      <div class="hstat"><span title="区间内 tokens ÷ 活跃分钟数">燃烧率</span><b class="num mono" id="h-burn">—</b></div>
+      <div class="hstat"><span id="h-burn-lab" title="区间内 tokens ÷ 活跃分钟数">燃烧率</span><b class="num mono" id="h-burn">—</b></div>
       <div class="hstat"><span>当前上下文</span><b class="num mono" id="h-ctx">—</b></div>
       <div class="hstat"><span>本轮 vs 上轮</span><b class="num mono" id="h-turn">—</b></div>
     </div>
@@ -1134,7 +1141,7 @@
   <!-- 堆叠趋势 + 模型榜 -->
   <div class="grid2">
     <div class="card">
-      <h2>Token 流量趋势
+      <h2><span id="trendTitle">Token 流量趋势</span>
         <span class="hint" id="trendHint"></span>
         <span class="seg" id="metricSeg">
           <button class="on" data-metric="total">总量</button>
@@ -1149,7 +1156,7 @@
     </div>
 
     <div class="card">
-      <h2>模型占比 <span class="hint">按输入 tokens</span></h2>
+      <h2>模型占比 <span class="hint" id="modelsHint">按输入 tokens</span></h2>
       <div id="modelsBox"></div>
     </div>
   </div>
@@ -1161,7 +1168,7 @@
   </div>
 
   <!-- 解码速度基线 -->
-  <div class="card">
+  <div class="card" id="baseCard">
     <h2>生成速率基线 <span class="hint" id="baseHint">来自 trace 的 generation span 真实耗时</span></h2>
     <div class="tablewrap">
       <table id="baseTable">
@@ -1313,7 +1320,8 @@
     return "#0B8A5B";
   }
   const MODEL_HEAD = { deepseek: "DeepSeek", kimi: "Kimi", glm: "GLM", gemini: "Gemini",
-    hy: "HY", space: "Space", bunny: "Bunny", qwen: "Qwen", gpt: "GPT", claude: "Claude" };
+    hy: "HY", space: "Space", bunny: "Bunny", qwen: "Qwen", gpt: "GPT", claude: "Claude",
+    minimax: "MiniMax" };
   function prettyModel(m) {
     if (!m) return "—";
     const segs = String(m).split("-");
@@ -1338,11 +1346,14 @@
 
   // ---------------------------------------------------------------- 状态
   let scope = "today";
-  let source = "all";        // all | workbuddy | qoder | codex | claude
+  let source = "all";        // auto | all | workbuddy | qoder | codex | claude
   // 当前源"有没有这项数据可显示"，由 renderSources 按 by_source 的真实数字判定。
   // 用数据驱动而不是能力位：Claude 理论上能记 token，但本机一条记录都没有。
   let hasTok = true;
   let hasCred = false;
+  // 实时读数条用哪个单位：tokens → t/s，credits → cr/min，requests → req/min。
+  // 跟"实时会话"走而不是跟全局能力走，否则全部来源下 Qoder 在跑时仍显示 0 t/s。
+  let liveUnit = "tokens";
   let metric = "total";
   let sortKey = "updated_at";
   let sortDir = -1;
@@ -1374,20 +1385,47 @@
     const rt = data.rates || {};
     const base = data.baseline || {};
 
+    // 单位跟着实时会话走：tokens → t/s，Qoder → credits/min + 请求/min
+    const unit = liveUnit;
+    const isTok = unit === "tokens";
+    const isCred = unit === "credits";
+    const isReq = unit === "requests";
+    const outVal = isTok ? (+rc.out_tps || 0)
+      : isCred ? (+lv.credit_per_min || +rc.credit_per_min || 0)
+      : (+lv.req_per_min || +rc.req_per_min || 0);
+    const inVal = isTok ? (+rc.in_tps || 0)
+      : isCred ? (+lv.req_per_min || +rc.req_per_min || 0) : 0;
+    $("h-out-lab").innerHTML = `<i style="background:#F6B26B"></i>${
+      isTok ? "下行 · 输出" : isCred ? "积分 · 每分钟" : "请求 · 每分钟"}`;
+    $("h-in-lab").innerHTML = `<i style="background:#8FB6F5"></i>${
+      isCred ? "请求 · 每分钟" : "上行 · 输入"}`;
+    $("h-out-unit").textContent = isTok ? "t/s" : isCred ? "cr/min" : "req/min";
+    $("h-in-unit").textContent = isTok ? "t/s" : isCred ? "req/min" : "";
     // 无实时采样时不要把「—」画成琥珀/蓝色短横，会被误读成一个很小的速率
-    const outTps = hasTok ? (+rc.out_tps || 0) : 0, inTps = hasTok ? (+rc.in_tps || 0) : 0;
-    $("h-out").textContent = fmtRate(outTps);
-    $("h-out").style.color = outTps ? "" : "#767D8A";
-    $("h-out").style.textShadow = outTps ? "" : "none";
-    $("h-in").textContent = fmtRate(inTps);
-    $("h-in").style.color = inTps ? "" : "#767D8A";
-    $("h-in").style.textShadow = inTps ? "" : "none";
-    $("h-gap").textContent = fmtMs(rc.median_gap_ms || rt.median_gap_ms);
-    // burn_per_min 的单位是 tokens/分钟，没有 token 的源恒为 0，显示「—」而不是 0
-    $("h-burn").textContent = (hasTok && rt.burn_per_min)
-      ? fmtShort(rt.burn_per_min) + "/min" : "—";
-    const ttft = (data.ttft || {}).ttft_ms || 0;
-    $("h-ttft").textContent = ttft ? fmtMs(ttft) : "—";
+    $("h-out").textContent = fmtRate(outVal);
+    $("h-out").style.color = outVal ? "" : "#767D8A";
+    $("h-out").style.textShadow = outVal ? "" : "none";
+    $("h-in").textContent = isReq ? "—" : fmtRate(inVal);
+    $("h-in").style.color = inVal && !isReq ? "" : "#767D8A";
+    $("h-in").style.textShadow = inVal && !isReq ? "" : "none";
+    $("h-gap").textContent = fmtMs(lv.median_gap_ms || rc.median_gap_ms || rt.median_gap_ms);
+    let burn = "—";
+    // 这一格始终是"区间均值"，和上面的实时读数不是一个窗口；
+    // credits/req 与实时值同单位，必须把标签说清楚，否则 1.2 和 0.1 看着像打架。
+    const burnLab = $("h-burn-lab");
+    if (isTok && rt.burn_per_min) burn = fmtShort(rt.burn_per_min) + "/min";
+    else if (isCred && rt.credit_per_min) burn = fmtRate(rt.credit_per_min) + " cr/min";
+    else if (isReq && rt.req_per_min) burn = fmtRate(rt.req_per_min) + " req/min";
+    burnLab.textContent = (isCred || isReq) ? "区间均值" : "燃烧率";
+    burnLab.title = isCred ? "区间内 credits ÷ 活跃分钟数"
+      : isReq ? "区间内请求数 ÷ 活跃分钟数" : "区间内 tokens ÷ 活跃分钟数";
+    $("h-burn").textContent = burn;
+    // 首字延迟跟实时会话走，避免全部来源下用 Codex 的 TTFT 冒充 Qoder 的
+    const ttObj = (lv.ttft != null)
+      ? { ttft_ms: lv.ttft, estimated: !!lv.ttft_est } : (data.ttft || {});
+    const ttft = ttObj.ttft_ms || 0;
+    const ttftEst = !!ttObj.estimated;
+    $("h-ttft").textContent = ttft ? (ttftEst ? "≈" : "") + fmtMs(ttft) : "—";
     const turn = data.turn;
     if (turn && turn.delta != null) {
       const up = turn.delta >= 0;
@@ -1401,10 +1439,15 @@
     $("h-ctx").style.color = (lv.size || lv.pct)
       ? (lv.pct >= .8 ? "#F6B26B" : "#E7E9ED") : "#767D8A";
 
-    const fresh = rc.samples > 0 && !rc.stale;
+    // 非 token 单位的读数来自实时会话（lv），基准行也必须用同一口径；
+    // all 模式下 rc 混着所有应用，会跟 hero 的 Qoder 读数对不上。
+    const useLv = !isTok && !!lv.unit;
+    const samples = useLv ? (+lv.recent_requests || 0)
+      : isTok ? (+rc.samples || 0) : (+rc.requests || 0);
+    const fresh = samples > 0 && !(useLv ? lv.stale : rc.stale);
     $("h-basis").textContent = fresh
-      ? `实时 · 最近 ${(rc.window_ms || 120000) / 1000}s · ${rc.samples} 个采样`
-      : (rc.fallback ? `空闲 · 最近 ${rc.samples} 次请求` : "暂无实时采样");
+      ? `实时 · 最近 ${(rc.window_ms || 120000) / 1000}s · ${samples} ${isTok ? "个采样" : "次请求"}`
+      : (rc.fallback ? `空闲 · 最近 ${rc.requests || 30} 次请求` : "暂无实时采样");
     $("h-basis").style.color = fresh ? "#9CC4FF" : "#8A93A1";
 
     drawSpark(data.minute_series || []);
@@ -1416,7 +1459,8 @@
     // 与 SVG 的 viewBox 保持一致；圆角柱 + 极淡基线，避免深色底上的"锯齿块"
     const W = 300, H = 62, pad = 2, cap = 15;
     // 没有 token 的源改画"请求/分钟"，否则这条 sparkline 会是一片平的底色
-    const val = (p) => (hasTok ? (p.output || 0) : (p.requests || 0));
+    const sparkTok = liveUnit === "tokens";
+    const val = (p) => (sparkTok ? (p.output || 0) : (p.requests || 0));
     const vals = series.map(val);
     const max = Math.max(1, ...vals);
     const n = Math.max(1, vals.length);
@@ -1453,7 +1497,7 @@
         stroke="rgba(255,255,255,.14)"/>
       ${bars}
       <text x="${W - pad}" y="10" text-anchor="end" font-size="10" fill="#8A919E" letter-spacing=".02em"
-        font-family="${MONO}">${hasTok ? "输出" : "请求"}/分 · 峰值 ${fmtShort(max)}</text>`;
+        font-family="${MONO}">${sparkTok ? "输出" : "请求"}/分 · 峰值 ${fmtShort(max)}</text>`;
     svg.querySelectorAll("[data-hit]").forEach((el) => {
       el.addEventListener("mousemove", (ev) => {
         const p = series[+el.dataset.hit];
@@ -1703,7 +1747,9 @@
     // 没有 token 的源（Qoder/Codex）改按请求数算占比与排序，
     // 否则整块都是 0.0% 的空条，看着像坏了。
     const key = hasTok ? "input" : "requests";
-    const sorted = models.slice().sort((a, b) => (b[key] || 0) - (a[key] || 0));
+    const sorted = models.filter((m) => (+m[key] || 0) > 0)
+      .sort((a, b) => (b[key] || 0) - (a[key] || 0));
+    if (!sorted.length) { box.innerHTML = '<div class="empty">暂无数据</div>'; return; }
     const top = sorted.slice(0, 7);
     const rest = sorted.slice(7);
     const totalIn = sorted.reduce((a, m) => a + (m[key] || 0), 0) || 1;
@@ -1787,7 +1833,7 @@
     const rows = (b.by_model || []).slice(0, 8);
     const body = $("baseBody");
     $("baseHint").textContent =
-      `来自 trace · 覆盖 ${b.samples || 0} 次请求（${pct(b.coverage, 0)}）· p95 ${fmtMs(b.p95_ms)}`;
+      `来自 trace · 覆盖 ${b.samples || 0} 次请求（${pct(b.coverage, 0)}）· p95 ${fmtMs(b.p95_ms)} · 模型后为调用它的 agent`;
     if (!rows.length) {
       body.innerHTML = '<tr><td colspan="6"><div class="empty">暂无 trace 采样（会话结束后才会落盘）</div></td></tr>';
       return;
@@ -1802,8 +1848,16 @@
     body.innerHTML = rows.map((m) => {
       const p = maxOut > 0 ? Math.round((+m.out_tps || 0) / maxOut * 100) : 0;
       const fast = m === fastest;
+      // 同一个模型可能被多个 agent 调用：按调用次数排，主要来源在前。
+      // 次数放进 title，徽标本身只留名字，避免把模型列撑宽。
+      const agents = (m.srcs || []).map((s) => {
+        const label = SRC_LABEL[s.id] || s.id;
+        const sub = (+m.sub_samples || 0)
+          ? ` · 其中子 agent ${nf.format(m.sub_samples)} 次` : "";
+        return `<span class="mtag agent" title="Agent：${esc(label)} · ${nf.format(s.n || 0)} 次采样${sub}">${esc(label)}</span>`;
+      }).join("");
       return `<tr${fast ? ' class="fast"' : ""}>
-        <td>${esc(prettyModel(m.model))}${fast ? '<span class="mtag amber">最快</span>' : ""}</td>
+        <td>${esc(prettyModel(m.model))}${agents}${fast ? '<span class="mtag amber">最快</span>' : ""}</td>
         <td class="num">${nf.format(m.samples)}</td>
         <td class="num mono db" style="--p:${p};--bc:var(--out-bg);color:var(--out);font-weight:600">${fmtRate(m.out_tps)}</td>
         <td class="num mono" style="color:var(--in)">${fmtRate(m.in_tps)}</td>
@@ -1845,6 +1899,10 @@
       const isTop = s === topSess;
       const pin = maxIn > 0 ? Math.round((+s.input || 0) / maxIn * 100) : 0;
       const pout = maxOut > 0 ? Math.round((+s.output || 0) / maxOut * 100) : 0;
+      // 全部视图里 Qoder 会话也会混进来，它没有 token 数据：
+      // 这些行按「—」画，别用 0 冒充"零吞吐"。
+      const rowNoTok = !hasTok
+        || (s.src === "qoder" && !(+s.input || 0) && !(+s.output || 0));
       return `<tr${isTop ? ' class="top"' : ""}>
         <td>
           <div class="t1wrap">
@@ -1858,13 +1916,15 @@
         <td><span class="pill" title="${esc(s.model || "")}">${esc(prettyModel(s.model))}</span></td>
         <td>
           <div class="ctxcell">
-            <span class="ctxpct" style="color:${c}">${s.size ? pct(p) : "—"}</span>
+            <span class="ctxpct" style="color:${c}">${(s.size || s.pct) ? pct(p) : "—"}</span>
             <div class="ctxbar"><div class="ctxfill" style="width:${Math.min(100, p * 100)}%;background:${c}"></div></div>
           </div>
         </td>
-        <td class="num mono" style="color:var(--out);font-weight:600">${fmtRate(s.out_tps)}</td>
-        <td class="num db" style="--p:${pin};--bc:var(--in-bg)">${fmtHTML(s.input)}</td>
-        <td class="num db" style="--p:${pout};--bc:var(--out-bg)">${fmtHTML(s.output)}</td>
+        <td class="num mono" style="color:var(--out);font-weight:600">${rowNoTok ? "—" : fmtRate(s.out_tps)}</td>
+        ${rowNoTok
+          ? '<td class="num" style="color:var(--hint)">—</td><td class="num" style="color:var(--hint)">—</td>'
+          : `<td class="num db" style="--p:${pin};--bc:var(--in-bg)">${fmtHTML(s.input)}</td>
+        <td class="num db" style="--p:${pout};--bc:var(--out-bg)">${fmtHTML(s.output)}</td>`}
         <td class="num">${nf.format(s.requests || 0)}</td>
         <td class="num" style="color:var(--muted)">${fmtDur(s.duration_ms)}</td>
         <td class="num">${(s.credit || 0).toFixed(1)}</td>
@@ -1891,9 +1951,20 @@
     const list = data.by_source || [];
     const byId = {};
     list.forEach((b) => { byId[b.id] = b; });
+    const resolved = data.source || "all";
+    const autoResolved = data.auto_source || resolved;
 
     document.querySelectorAll("#srcTabs .tab").forEach((btn) => {
       const id = btn.dataset.source;
+      if (id === "auto") {
+        const b = byId[autoResolved] || {};
+        const n = b.records || 0;
+        const lab = autoResolved === "all" ? "全部" : (SRC_LABEL[autoResolved] || autoResolved);
+        btn.textContent = n ? `自动 · ${lab} ${fmtShort(n)}` : `自动 · ${lab}`;
+        btn.style.opacity = "";
+        btn.title = `自动跟随最近活动的应用；当前：${lab}`;
+        return;
+      }
       if (id === "all") {
         const n = list.reduce((a, b) => a + (b.records || 0), 0);
         btn.textContent = n ? `全部 ${fmtShort(n)}` : "全部";
@@ -1907,13 +1978,39 @@
       btn.style.opacity = n ? "" : "0.5";
       btn.title = b.note || (n ? "" : "本机无数据");
     });
+    const onBtn = document.querySelector("#srcTabs .tab.on");
+    const srcBar = $("srcTabs");
+    if (onBtn && srcBar && srcBar.scrollWidth > srcBar.clientWidth) {
+      const bar = srcBar.getBoundingClientRect();
+      const b = onBtn.getBoundingClientRect();
+      const l = b.left - bar.left + srcBar.scrollLeft;
+      if (l < srcBar.scrollLeft) srcBar.scrollLeft = Math.max(0, l - 4);
+      else if (b.right > bar.right) {
+        srcBar.scrollLeft += b.right - bar.right + 4;
+      }
+    }
 
-    const cur = source === "all" ? null : (byId[source] || {});
+    const isAuto = source === "auto";
+    const curId = isAuto ? autoResolved : source;
+    const cur = (source === "all" || curId === "all") ? null : (byId[curId] || {});
     const pool = source === "all" ? list : [cur];
-    hasTok = pool.some((b) => ((b.input || 0) + (b.output || 0)) > 0);
-    hasCred = pool.some((b) => (b.credits || 0) > 0);
+    // units 由服务端按"筛选后的记录"算出，比为每个源猜能力位更准
+    const u = data.units || {};
+    hasTok = u.tokens != null ? !!u.tokens
+      : pool.some((b) => ((b.input || 0) + (b.output || 0)) > 0);
+    hasCred = u.credits != null ? !!u.credits
+      : pool.some((b) => (b.credits || 0) > 0);
+    // 实时读数条跟实时会话走：全部来源下 Qoder 在跑时显示 cr/min 而不是 0 t/s
+    liveUnit = (data.live || {}).unit || u.primary
+      || (hasTok ? "tokens" : hasCred ? "credits" : "requests");
 
     const bits = [];
+    if (isAuto) {
+      const lab = autoResolved === "all"
+        ? "最近 120 秒内没有应用活动，暂按全部应用统计。"
+        : `当前跟随 <b>${esc(SRC_LABEL[autoResolved] || autoResolved)}</b>。`;
+      bits.push("自动跟随：" + lab);
+    }
     if (cur && cur.note) bits.push(esc(cur.note));
     if (!hasTok) {
       bits.push("「—」表示<b>该应用没有回传这项数据</b>，不是 0。");
@@ -1932,6 +2029,11 @@
     if (!hasTok && (metric === "total" || metric === "input" || metric === "output")) {
       setMetric(hasCred ? "credit" : "requests");
     }
+    // 标题和基线卡跟着当前单位走：Qoder 没有 token，不能挂着 "Token 流量" 和
+    // 一张全是 0 t/s 的生成基线表去误导。
+    $("trendTitle").textContent = hasTok ? "Token 流量趋势" : "用量趋势";
+    $("modelsHint").textContent = hasTok ? "按输入 tokens" : "按请求数";
+    $("baseCard").style.display = hasTok ? "" : "none";
   }
 
   function render(data) {
@@ -2070,7 +2172,7 @@
         x.classList.toggle("on", x.dataset.scope === s));
     }
     const src = hp.get("source") || qp.get("source");
-    if (src && ["all", "workbuddy", "qoder", "codex", "claude"].includes(src)) {
+    if (src && ["auto", "all", "workbuddy", "qoder", "codex", "claude"].includes(src)) {
       source = src;
       document.querySelectorAll("#srcTabs .tab").forEach((x) =>
         x.classList.toggle("on", x.dataset.source === src));
@@ -2082,8 +2184,8 @@
     {title:"形象与交互", fields:[
       {path:"pet.scale", label:"宠物大小", type:"select",
        opts:[[0.5,"50%"],[0.75,"75%"],[1,"100%"],[1.25,"125%"],[1.5,"150%"]]},
-      {path:"pet.wander", label:"随机漫步", type:"bool", hint:"间隔 9–26 秒随机，目标与步速也随机"},
-      {path:"pet.look_tracking", label:"注视鼠标", type:"bool", hint:"鼠标靠近时按角度转向"},
+      {path:"pet.wander", label:"随机漫步", type:"bool", hint:"间隔 10–30 秒随机；避开鼠标与屏幕边缘，长距离会放慢"},
+      {path:"pet.look_tracking", label:"注视鼠标", type:"bool", hint:"鼠标靠近时按角度转向；可与漫步同时开启，走路时自动让位"},
       {path:"pet.look_offset", label:"注视角度偏移", type:"number", step:15,
        hint:"0 = 正面朝镜头，270 = 朝右；方向不对调这个"},
       {path:"pet.look_range", label:"注视范围 (px)", type:"number", step:50,

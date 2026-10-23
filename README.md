@@ -739,6 +739,33 @@ def run():
 **验证**：桩对象逐项点击——六个勾选项的变量都正确翻转、处理器读到新值、重新生成菜单
 时勾选态同步；四个单选子菜单的设置值与提示文字一致。
 
+### v3.17 多应用自动跟随 + 一手 token 数据
+
+**问题**：仪表盘虽然有 WorkBuddy / Qoder / Codex / Claude 四个来源，但此前自动模式主要
+看"最近有没有请求"，切到对应应用后经常要等十几秒才有反应；Codex / Claude 的历史数据
+还要靠 cc-switch 间接补；Qoder 没有 token 时，面板和基线表会挂着 0 t/s 或空白上下文。
+
+**做法**：
+
+- **自动跟随**：综合最近活动时间、当前前台进程和 20 秒防抖；用户主动切到某个应用时
+  立即跟随，后台应用偶发请求不会把标签来回抢。新增 `source=auto` 白名单与
+  `/api/live` 的 `requested_source` / `units` 字段。
+- **一手数据优先**：Codex 直接读原生 `sessions/**/rollout-*.jsonl`（token、真实首字延迟），
+  Claude 直接读 `projects/**/*.jsonl`；cc-switch 只在原生数据缺失时补历史与 TTFT，
+  不再反向覆盖一手记录。Qoder 明确只有 credits 与 `context_usage_ratio`，不伪造 token。
+- **单位自适应**：面板和看板按来源显示 `tokens/s`、`credits/min`、`requests/min`；
+  标题、排序、燃烧率与基线卡随单位切换，Qoder 不再出现一排 0 t/s。
+- **模型后面标 agent**：生成基线表在模型名后标注实际调用它的来源
+  （WorkBuddy / Qoder / Codex / Claude），同一模型被多个 agent 使用会并列显示；
+  悬停可看各自采样次数和其中子 agent 的请求数。
+- **面板细节**：速率单位按字体实际宽度让位（修复 `req/min` 压住数字）；服务未启动时
+  本地兜底保留上下文与活跃状态，并会在连续取不到数据时自动拉起 `server.py`。
+- 重写随机漫步与鼠标注视的更新路径，减少状态泵抖动；对应开关在设置中按需开启。
+
+**验证**（2026-10-23，本机）：自动源在前台切换到 Codex 时立即生效，后台请求防抖正常；
+基线表 905 次 `DeepSeek-V4.1-Flash` 采样正确并列 WorkBuddy / Qoder，Codex 行并列 Claude；
+停掉服务后桌宠在约 9 秒内自动恢复；看板无控制台报错。
+
 ### v3.16 余额提取器：linoroute / LMU / Zhipu GLM
 
 **问题**：这三家在设置页一直是"未启用 + 备注原因"，但站点其实都有余额接口——

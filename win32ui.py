@@ -315,6 +315,41 @@ class Tray:
         self.ok = False
 
 
+# ---------------------------------------------------------------- 前台进程
+
+def foreground_process_name() -> str:
+    """当前前台窗口的进程映像名（如 Qoder CN.exe）。失败返回空串。"""
+    try:
+        kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        kernel32.OpenProcess.restype = wt.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+        kernel32.QueryFullProcessImageNameW.restype = wt.BOOL
+        kernel32.CloseHandle.argtypes = [wt.HANDLE]
+        kernel32.CloseHandle.restype = wt.BOOL
+
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return ""
+        pid = wt.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        h = kernel32.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            size = wt.DWORD(1024)
+            if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return buf.value.rsplit("\\", 1)[-1]
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        pass
+    return ""
+
+
 # ---------------------------------------------------------------- 全屏检测
 
 def is_fullscreen_foreground() -> bool:
