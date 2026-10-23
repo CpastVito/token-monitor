@@ -681,7 +681,7 @@ def ctx_gauges(used: int, model_size: int, ctx_window: int) -> Dict[str, Any]:
 
     主口径 size / pct 取 sessions.context_window，即客户端认定的**有效上下文窗口**：
     WorkBuddy 界面的百分比和自动压缩的触发判定都以它为基准，实测为模型物理上限
-    的 60%。
+    的 60%（600K vs 1M）。
 
     副口径 size_model / pct_model 取 session_usage.size，即模型**物理输入上限**
     （~/.workbuddy/models.json 的 maxInputTokens）。
@@ -697,6 +697,33 @@ def ctx_gauges(used: int, model_size: int, ctx_window: int) -> Dict[str, Any]:
         "size_model": extra,
         "pct_model": (used / extra) if extra else 0.0,
     }
+
+
+def latest_ctx_ratio(recs: List[Dict[str, Any]]) -> float:
+    """
+    非 WorkBuddy 源的「当前上下文」：取**最近一条带比值**的请求的 ctx（0~1）。
+
+    这类客户端（Qoder 等）把 `context_usage_ratio` 直接写进每次请求的 usage，
+    它本身已经是**有效窗口口径**——客户端也做自动压缩，压缩后的请求会把比值
+    写低。因此当前占用必须取时间上最后一条，而不是窗口内最大值：
+
+    取 max 会一直挂着压缩前的峰值，表现为"压缩完读数不降"，与 WorkBuddy 源
+    （读 session_usage.used，压缩即回落）语义不一致。
+
+    只接受 > 0 的样本：老记录可能根本没有该字段（落库时补的 0.0），若最后一条
+    恰好缺字段就被误判成"上下文为空"。整段都没有比值时返回 0，前端显示「—」。
+    """
+    latest = 0.0
+    latest_ts = None
+    for r in recs:
+        v = r.get("ctx") or 0.0
+        if v <= 0:
+            continue
+        ts = r.get("ts") or 0
+        if latest_ts is None or ts >= latest_ts:
+            latest_ts = ts
+            latest = float(v)
+    return latest
 
 
 # ---------------------------------------------------------------- 速率计算
@@ -1266,7 +1293,8 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
                 }
             )
         # 其它源（Qoder / Codex / Claude / CodeBuddy）没有会话元数据库，直接从记录聚合出行。
-        # 上下文占用用 Qoder 的 context_usage_ratio（0~1），拿不到 used/size 绝对值。
+        # 上下文占用用客户端自己写的比值（Qoder 的 context_usage_ratio，0~1），拿不到
+        # used/size 绝对值；取最近一条而非峰值，压缩后才会跟着回落。
         have = {s["id"] for s in sessions}
         for sid, a in sess_agg.items():
             if sid in have:
@@ -1274,7 +1302,7 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
             recs_s = a.get("recs") or []
             dec = decode_stats(recs_s)
             lv = live_stats(recs_s)
-            ctx = max((r.get("ctx") or 0.0) for r in recs_s) if recs_s else 0.0
+            ctx = latest_ctx_ratio(recs_s)
             sessions.append(
                 {
                     "id": sid,
@@ -1370,9 +1398,10 @@ def build_summary(scope: str = "all", with_sessions: bool = True,
         # 非 WorkBuddy 源没有 session_usage 表，实时上下文占用改用记录里的
         # context_usage_ratio（Qoder 直接给 0~1 的比例）。used/size 拿不到就留 0，
         # UI 靠 pct_source 知道该只显示百分比、不要显示"x / y tokens"。
+        # 同样取最近一条：客户端自动压缩后比值回落，不能用窗口峰值。
         a = sess_agg[sess_sid]
         recs_s = a.get("recs") or []
-        ctx = max((r.get("ctx") or 0.0) for r in recs_s) if recs_s else 0.0
+        ctx = latest_ctx_ratio(recs_s)
         live_src = (recs_s[0].get("src") if recs_s else "") or ""
         # 速率只取当前会话/当前源，别把 all 下其它应用的流量算进这一条读数
         recs_rate = [r for r in recent_recs if r.get("src") == live_src] or recs_s
